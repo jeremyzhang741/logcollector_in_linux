@@ -388,9 +388,7 @@ try:
             level VARCHAR(20),
             service VARCHAR(255),
             pid INTEGER,
-            message TEXT,
-            raw_line TEXT,
-            metadata JSONB DEFAULT '{}'::jsonb
+            message TEXT
         )
     ''')
 

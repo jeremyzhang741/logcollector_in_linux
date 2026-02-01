@@ -84,9 +84,7 @@ def init_database():
                 level VARCHAR(20),
                 service VARCHAR(255),
                 pid INTEGER,
-                message TEXT,
-                raw_line TEXT,
-                metadata JSONB DEFAULT '{}'::jsonb
+                message TEXT
             )
         ''')
         
@@ -124,15 +122,13 @@ def init_database():
 def parse_log_line(line, log_type):
     """解析单行日志"""
     result = {
-        'raw_line': line,
         'level': 'info',
         'service': None,
         'pid': None,
         'message': line,
-        'timestamp': None,
-        'metadata': {}
+        'timestamp': None
     }
-    
+
     # 尝试匹配syslog格式
     match = SYSLOG_PATTERN.match(line)
     if match:
@@ -142,32 +138,27 @@ def parse_log_line(line, log_type):
             'pid': int(match.group('pid')) if match.group('pid') else None,
             'message': match.group('message')
         })
-    
+
     # 检测日志级别
     line_lower = line.lower()
     for level, priority in sorted(LOG_LEVELS.items(), key=lambda x: x[1]):
         if level in line_lower:
             result['level'] = level if level not in ('err', 'warn') else ('error' if level == 'err' else 'warning')
             break
-    
+
     # 特殊日志类型解析
     if log_type == 'auth':
         auth_match = AUTH_LOG_PATTERN.search(line)
         if auth_match:
-            result['metadata'] = {
-                'action': auth_match.group('action'),
-                'user': auth_match.group('user'),
-                'ip': auth_match.group('ip')
-            }
+            # auth 日志检测失败情况
             if 'failed' in line_lower or 'invalid' in line_lower:
                 result['level'] = 'warning'
-    
+
     elif log_type == 'kern':
         kern_match = KERNEL_PATTERN.search(line)
         if kern_match:
-            result['metadata']['uptime'] = kern_match.group('uptime')
             result['message'] = kern_match.group('message')
-    
+
     return result
 
 
@@ -273,16 +264,15 @@ class LogHandler(BaseHTTPRequestHandler):
                     continue
                 
                 parsed = parse_log_line(line, log_type)
-                
+
                 cursor.execute('''
-                    INSERT INTO log_entries 
-                    (server_id, hostname, log_type, timestamp, level, service, pid, message, raw_line, metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO log_entries
+                    (server_id, hostname, log_type, timestamp, level, service, pid, message)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ''', (
                     server_id, hostname, log_type,
                     parsed['timestamp'], parsed['level'], parsed['service'],
-                    parsed['pid'], parsed['message'], parsed['raw_line'],
-                    json.dumps(parsed['metadata'])
+                    parsed['pid'], parsed['message']
                 ))
                 inserted += 1
                 stats[parsed['level']] += 1
@@ -457,16 +447,16 @@ class LogHandler(BaseHTTPRequestHandler):
             offset = int(params.get('offset', ['0'])[0])
             
             query = f'''
-                SELECT id, server_id, hostname, log_type, timestamp, received_at, 
-                       level, service, message, metadata
-                FROM log_entries 
+                SELECT id, server_id, hostname, log_type, timestamp, received_at,
+                       level, service, message
+                FROM log_entries
                 WHERE {' AND '.join(conditions)}
                 ORDER BY received_at DESC
                 LIMIT %s OFFSET %s
             '''
-            
+
             cursor.execute(query, values + [limit, offset])
-            
+
             logs = []
             for row in cursor.fetchall():
                 logs.append({
@@ -478,8 +468,7 @@ class LogHandler(BaseHTTPRequestHandler):
                     'received_at': row['received_at'],
                     'level': row['level'],
                     'service': row['service'],
-                    'message': row['message'],
-                    'metadata': row['metadata'] if row['metadata'] else {}
+                    'message': row['message']
                 })
             
             # 获取总数
