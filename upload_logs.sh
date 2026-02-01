@@ -1,17 +1,17 @@
 #!/bin/bash
 #
-# LogVista 日志上传脚本
+# LogVista 日志上传脚本 (无认证版本)
 # 用于将Linux服务器日志发送到日志分析平台
 #
 # 使用方法:
-#   1. 首次使用需要注册服务器获取API Key
-#   2. 配置脚本中的SERVER_URL和API_KEY
+#   1. 首次使用需要注册服务器
+#   2. 配置脚本中的SERVER_URL
 #   3. 运行脚本上传日志
 #
 # 示例:
 #   ./upload_logs.sh                    # 上传默认日志
 #   ./upload_logs.sh /var/log/syslog    # 上传指定日志文件
-#   ./upload_logs.sh --register         # 注册服务器获取API Key
+#   ./upload_logs.sh --register         # 注册服务器
 #   ./upload_logs.sh --daemon           # 后台持续监控模式
 #
 
@@ -20,9 +20,6 @@ set -e
 # ==================== 配置区域 ====================
 # 日志分析平台地址
 SERVER_URL="${LOG_SERVER_URL:-http://localhost:8080}"
-
-# API密钥（注册后填写）
-API_KEY="${LOG_API_KEY:-}"
 
 # 默认监控的日志文件
 DEFAULT_LOGS=(
@@ -72,8 +69,9 @@ log_error() {
 print_banner() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════╗"
-    echo "║       LogVista 日志上传工具 v1.0         ║"
+    echo "║       LogVista 日志上传工具 v1.1         ║"
     echo "║   Linux服务器日志收集与分析平台          ║"
+    echo "║          (无认证版本)                    ║"
     echo "╚══════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -115,6 +113,19 @@ get_ip() {
     hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown"
 }
 
+# 获取或生成server_id
+get_server_id() {
+    local id_file="${STATE_DIR}/server_id"
+    
+    if [ -f "$id_file" ]; then
+        cat "$id_file"
+    else
+        # 首次运行，需要注册
+        log_warning "服务器尚未注册，请先运行: $0 --register"
+        exit 1
+    fi
+}
+
 # ==================== 核心功能 ====================
 
 # 注册服务器
@@ -134,45 +145,30 @@ register_server() {
         }")
     
     if echo "$response" | jq -e '.success' > /dev/null 2>&1; then
-        local api_key=$(echo "$response" | jq -r '.api_key')
         local server_id=$(echo "$response" | jq -r '.server_id')
         
         log_success "服务器注册成功！"
         echo ""
         echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${GREEN}║${NC} 服务器ID: ${YELLOW}${server_id}${NC}"
-        echo -e "${GREEN}║${NC} API密钥:  ${YELLOW}${api_key}${NC}"
+        echo -e "${GREEN}║${NC} 主机名:    ${YELLOW}${hostname}${NC}"
+        echo -e "${GREEN}║${NC} 服务器ID:  ${YELLOW}${server_id}${NC}"
+        echo -e "${GREEN}║${NC} IP地址:    ${YELLOW}${ip}${NC}"
         echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
         echo ""
-        echo "请保存以上API密钥，并设置环境变量:"
-        echo -e "  ${CYAN}export LOG_API_KEY=\"${api_key}\"${NC}"
-        echo "或编辑此脚本，填写 API_KEY 变量"
-        echo ""
         
-        # 保存到配置文件
-        echo "$api_key" > "${STATE_DIR}/api_key"
-        chmod 600 "${STATE_DIR}/api_key"
-        log_info "API密钥已保存到 ${STATE_DIR}/api_key"
+        # 保存server_id
+        echo "$server_id" > "${STATE_DIR}/server_id"
+        chmod 600 "${STATE_DIR}/server_id"
+        log_info "服务器ID已保存到 ${STATE_DIR}/server_id"
+        
+        echo ""
+        log_info "现在可以开始上传日志了:"
+        echo "  $0 --all      # 上传所有默认日志"
+        echo "  $0 --daemon   # 守护进程模式"
     else
         log_error "注册失败: $response"
         exit 1
     fi
-}
-
-# 加载API密钥
-load_api_key() {
-    if [ -n "$API_KEY" ]; then
-        return 0
-    fi
-    
-    if [ -f "${STATE_DIR}/api_key" ]; then
-        API_KEY=$(cat "${STATE_DIR}/api_key")
-        return 0
-    fi
-    
-    log_error "未找到API密钥"
-    echo "请先运行: $0 --register"
-    exit 1
 }
 
 # 获取文件的上次读取位置
@@ -199,8 +195,9 @@ save_file_position() {
 # 上传日志内容
 upload_logs() {
     local log_type="$1"
+    local server_id="$2"
     local hostname=$(get_hostname)
-    shift
+    shift 2
     local logs=("$@")
     
     if [ ${#logs[@]} -eq 0 ]; then
@@ -211,14 +208,14 @@ upload_logs() {
     local json_logs=$(printf '%s\n' "${logs[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
     
     local payload=$(jq -n \
+        --arg server_id "$server_id" \
         --arg hostname "$hostname" \
         --arg log_type "$log_type" \
         --argjson logs "$json_logs" \
-        '{hostname: $hostname, log_type: $log_type, logs: $logs}')
+        '{server_id: $server_id, hostname: $hostname, log_type: $log_type, logs: $logs}')
     
     local response=$(curl -s -X POST "${SERVER_URL}/api/upload" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: ${API_KEY}" \
         -d "$payload")
     
     if echo "$response" | jq -e '.success' > /dev/null 2>&1; then
@@ -236,6 +233,7 @@ process_log_file() {
     local file="$1"
     local log_type="$2"
     local incremental="$3"
+    local server_id="$4"
     
     if [ ! -f "$file" ]; then
         log_warning "文件不存在: $file"
@@ -278,7 +276,7 @@ process_log_file() {
             
             # 达到批量大小，上传
             if [ ${#batch[@]} -ge $BATCH_SIZE ]; then
-                upload_logs "$log_type" "${batch[@]}"
+                upload_logs "$log_type" "$server_id" "${batch[@]}"
                 batch=()
             fi
         fi
@@ -286,7 +284,7 @@ process_log_file() {
     
     # 上传剩余的日志
     if [ ${#batch[@]} -gt 0 ]; then
-        upload_logs "$log_type" "${batch[@]}"
+        upload_logs "$log_type" "$server_id" "${batch[@]}"
     fi
     
     # 保存位置
@@ -300,20 +298,24 @@ process_log_file() {
 # 上传所有默认日志
 upload_all_logs() {
     local incremental="${1:-false}"
+    local server_id=$(get_server_id)
     
     for entry in "${DEFAULT_LOGS[@]}"; do
         local file="${entry%%:*}"
         local type="${entry##*:}"
         
         if [ -f "$file" ]; then
-            process_log_file "$file" "$type" "$incremental"
+            process_log_file "$file" "$type" "$incremental" "$server_id"
         fi
     done
 }
 
 # 守护进程模式
 daemon_mode() {
+    local server_id=$(get_server_id)
+    
     log_info "启动守护进程模式 (间隔: ${CHECK_INTERVAL}秒)"
+    log_info "服务器ID: $server_id"
     log_info "按 Ctrl+C 停止"
     echo ""
     
@@ -332,6 +334,7 @@ daemon_mode() {
 tail_mode() {
     local file="$1"
     local log_type="${2:-syslog}"
+    local server_id=$(get_server_id)
     
     if [ ! -f "$file" ]; then
         log_error "文件不存在: $file"
@@ -339,6 +342,7 @@ tail_mode() {
     fi
     
     log_info "实时跟踪: $file"
+    log_info "服务器ID: $server_id"
     log_info "按 Ctrl+C 停止"
     
     trap 'log_info "停止跟踪"; exit 0' INT TERM
@@ -350,7 +354,7 @@ tail_mode() {
             batch+=("$line")
             
             if [ ${#batch[@]} -ge 10 ]; then
-                upload_logs "$log_type" "${batch[@]}"
+                upload_logs "$log_type" "$server_id" "${batch[@]}"
                 batch=()
             fi
         fi
@@ -363,16 +367,16 @@ show_help() {
     echo "用法: $0 [选项] [日志文件]"
     echo ""
     echo "选项:"
-    echo "  --register       注册服务器并获取API密钥"
+    echo "  --register       注册服务器（首次使用必须执行）"
     echo "  --daemon         后台守护进程模式，持续监控日志"
     echo "  --tail <file>    实时跟踪指定日志文件"
     echo "  --type <type>    指定日志类型 (syslog|auth|kern|app)"
     echo "  --all            上传所有默认日志文件"
+    echo "  --status         显示当前状态"
     echo "  --help           显示此帮助信息"
     echo ""
     echo "环境变量:"
     echo "  LOG_SERVER_URL   日志服务器地址 (默认: http://localhost:8080)"
-    echo "  LOG_API_KEY      API密钥"
     echo ""
     echo "示例:"
     echo "  $0 --register                    # 首次使用，注册服务器"
@@ -397,10 +401,12 @@ show_status() {
     echo "配置信息:"
     echo "  服务器地址: $SERVER_URL"
     
-    if [ -n "$API_KEY" ]; then
-        echo "  API密钥: ${API_KEY:0:8}...${API_KEY: -8}"
+    if [ -f "${STATE_DIR}/server_id" ]; then
+        local server_id=$(cat "${STATE_DIR}/server_id")
+        echo "  服务器ID: $server_id"
+        echo "  状态: ✓ 已注册"
     else
-        echo "  API密钥: 未配置"
+        echo "  状态: ✗ 未注册 (请运行 $0 --register)"
     fi
     
     echo "  状态目录: $STATE_DIR"
@@ -419,6 +425,15 @@ show_status() {
             echo -e "  ${RED}✗${NC} $file ($type) - 不存在"
         fi
     done
+    
+    # 测试服务器连接
+    echo ""
+    echo "测试服务器连接..."
+    if curl -s --connect-timeout 5 "${SERVER_URL}/api/stats" > /dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} 服务器连接正常"
+    else
+        echo -e "  ${RED}✗${NC} 无法连接到服务器"
+    fi
 }
 
 # ==================== 主程序 ====================
@@ -484,34 +499,29 @@ main() {
             register_server
             ;;
         status)
-            load_api_key
             show_status
             ;;
         daemon)
-            load_api_key
             daemon_mode
             ;;
         tail)
-            load_api_key
             tail_mode "$target_file" "$log_type"
             ;;
         all)
-            load_api_key
             upload_all_logs "false"
             ;;
         file)
-            load_api_key
             if [ -n "$target_file" ]; then
-                process_log_file "$target_file" "$log_type" "false"
+                local server_id=$(get_server_id)
+                process_log_file "$target_file" "$log_type" "false" "$server_id"
             else
                 log_error "请指定日志文件"
                 exit 1
             fi
             ;;
         *)
-            # 默认行为：上传所有日志
-            load_api_key
-            upload_all_logs "false"
+            # 默认行为：显示状态
+            show_status
             ;;
     esac
 }

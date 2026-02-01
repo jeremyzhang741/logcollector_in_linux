@@ -8,9 +8,8 @@ Type=simple
 User=root
 Group=root
 
-# 环境变量配置
+# 环境变量配置 - 只需要服务器地址
 Environment="LOG_SERVER_URL=http://your-log-server:8080"
-Environment="LOG_API_KEY=your-api-key-here"
 
 # 或者使用环境文件
 # EnvironmentFile=/etc/logvista/config
