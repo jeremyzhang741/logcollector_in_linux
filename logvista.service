@@ -1,0 +1,38 @@
+[Unit]
+Description=LogVista Log Upload Service
+Documentation=https://github.com/your-repo/logvista
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# 环境变量配置
+Environment="LOG_SERVER_URL=http://your-log-server:8080"
+Environment="LOG_API_KEY=your-api-key-here"
+
+# 或者使用环境文件
+# EnvironmentFile=/etc/logvista/config
+
+# 执行脚本
+ExecStart=/opt/logvista/upload_logs.sh --daemon
+
+# 重启策略
+Restart=always
+RestartSec=30
+
+# 日志配置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=logvista
+
+# 安全设置
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/
+ReadWritePaths=/var/log /root/.logvista
+
+[Install]
+WantedBy=multi-user.target
