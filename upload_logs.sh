@@ -78,13 +78,19 @@ print_banner() {
 
 check_dependencies() {
     local missing=()
-    
-    for cmd in curl jq hostname; do
+
+    # 检查 curl 和 hostname
+    for cmd in curl hostname; do
         if ! command -v $cmd &> /dev/null; then
             missing+=($cmd)
         fi
     done
-    
+
+    # 检查 Python（优先 python3，其次 python）
+    if ! command -v python3 &> /dev/null && ! command -v python &> /dev/null; then
+        missing+=("python3或python")
+    fi
+
     if [ ${#missing[@]} -gt 0 ]; then
         log_error "缺少必要依赖: ${missing[*]}"
         echo "请安装: sudo apt-get install ${missing[*]}"
@@ -94,6 +100,17 @@ check_dependencies() {
 
 init_state_dir() {
     mkdir -p "$STATE_DIR"
+}
+
+# 获取可用的 Python 命令
+get_python_cmd() {
+    if command -v python3 &> /dev/null; then
+        echo "python3"
+    elif command -v python &> /dev/null; then
+        echo "python"
+    else
+        echo ""
+    fi
 }
 
 get_hostname() {
@@ -143,9 +160,13 @@ register_server() {
             \"ip\": \"${ip}\",
             \"os_info\": \"${os_info}\"
         }")
-    
-    if echo "$response" | jq -e '.success' > /dev/null 2>&1; then
-        local server_id=$(echo "$response" | jq -r '.server_id')
+
+    # 使用 Python 解析 JSON 响应
+    local PYTHON=$(get_python_cmd)
+    local success=$($PYTHON -c "import json,sys; data=json.loads('''$response'''); print('true' if data.get('success') else 'false')" 2>/dev/null)
+
+    if [ "$success" = "true" ]; then
+        local server_id=$($PYTHON -c "import json,sys; data=json.loads('''$response'''); print(data.get('server_id', ''))")
         
         log_success "服务器注册成功！"
         echo ""
@@ -203,23 +224,37 @@ upload_logs() {
     if [ ${#logs[@]} -eq 0 ]; then
         return 0
     fi
-    
-    # 构建JSON数组
-    local json_logs=$(printf '%s\n' "${logs[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-    
-    local payload=$(jq -n \
-        --arg server_id "$server_id" \
-        --arg hostname "$hostname" \
-        --arg log_type "$log_type" \
-        --argjson logs "$json_logs" \
-        '{server_id: $server_id, hostname: $hostname, log_type: $log_type, logs: $logs}')
-    
+
+    # 使用 Python 构建 JSON payload
+    local PYTHON=$(get_python_cmd)
+    local payload=$($PYTHON -c "
+import json
+import sys
+
+logs = []
+for line in '''$(printf '%s\n' "${logs[@]}")'''.split('\n'):
+    if line.strip():
+        logs.append(line)
+
+data = {
+    'server_id': '''$server_id''',
+    'hostname': '''$hostname''',
+    'log_type': '''$log_type''',
+    'logs': logs
+}
+
+print(json.dumps(data))
+")
+
     local response=$(curl -s -X POST "${SERVER_URL}/api/upload" \
         -H "Content-Type: application/json" \
         -d "$payload")
-    
-    if echo "$response" | jq -e '.success' > /dev/null 2>&1; then
-        local inserted=$(echo "$response" | jq -r '.inserted')
+
+    # 使用 Python 解析响应
+    local success=$($PYTHON -c "import json,sys; data=json.loads('''$response'''); print('true' if data.get('success') else 'false')" 2>/dev/null)
+
+    if [ "$success" = "true" ]; then
+        local inserted=$($PYTHON -c "import json,sys; data=json.loads('''$response'''); print(data.get('inserted', 0))")
         log_success "上传成功: ${inserted} 条日志 (类型: ${log_type})"
         return 0
     else
