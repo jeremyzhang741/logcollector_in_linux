@@ -1,17 +1,11 @@
 #!/bin/bash
 #
-# LogVista 日志上传脚本 (无认证版本)
-# 用于将Linux服务器日志发送到日志分析平台
+# WAL 日志上传脚本
+# 用于将数据库 WAL 日志发送到日志分析平台
 #
 # 使用方法:
-#   1. 首次使用需要注册服务器
-#   2. 配置脚本中的SERVER_URL
-#   3. 运行脚本上传日志
-#
-# 示例:
-#   ./upload_logs.sh                    # 上传默认日志
-#   ./upload_logs.sh /var/log/syslog    # 上传指定日志文件
-#   ./upload_logs.sh --register         # 注册服务器
+#   ./upload_logs.sh --register         # 注册服务器（首次使用）
+#   ./upload_logs.sh /path/to/wal.log   # 上传指定 WAL 日志文件
 #   ./upload_logs.sh --daemon           # 后台持续监控模式
 #
 
@@ -21,14 +15,12 @@ set -e
 # 日志分析平台地址
 SERVER_URL="${LOG_SERVER_URL:-http://localhost:8080}"
 
-# 默认监控的日志文件
+# WAL 日志文件路径（可通过环境变量配置）
+WAL_LOG_FILE="${WAL_LOG_FILE:-/var/log/wal/wal.log}"
+
+# 默认监控的 WAL 日志文件
 DEFAULT_LOGS=(
-    "/var/log/syslog:syslog"
-    "/var/log/auth.log:auth"
-    "/var/log/kern.log:kern"
-    "/var/log/messages:syslog"
-    "/var/log/secure:auth"
-    "/var/log/dmesg:kern"
+    "${WAL_LOG_FILE}:wal"
 )
 
 # 批量上传大小（行数）
@@ -69,9 +61,8 @@ log_error() {
 print_banner() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════╗"
-    echo "║       LogVista 日志上传工具 v1.1         ║"
-    echo "║   Linux服务器日志收集与分析平台          ║"
-    echo "║          (无认证版本)                    ║"
+    echo "║       WAL 日志上传工具 v2.0              ║"
+    echo "║   数据库 WAL 日志收集与分析平台          ║"
     echo "╚══════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -399,34 +390,31 @@ tail_mode() {
 # 显示帮助
 show_help() {
     print_banner
-    echo "用法: $0 [选项] [日志文件]"
+    echo "用法: $0 [选项] [WAL日志文件]"
     echo ""
     echo "选项:"
     echo "  --register       注册服务器（首次使用必须执行）"
-    echo "  --daemon         后台守护进程模式，持续监控日志"
-    echo "  --tail <file>    实时跟踪指定日志文件"
-    echo "  --type <type>    指定日志类型 (syslog|auth|kern|app)"
-    echo "  --all            上传所有默认日志文件"
+    echo "  --daemon         后台守护进程模式，持续监控 WAL 日志"
+    echo "  --tail <file>    实时跟踪指定 WAL 日志文件"
+    echo "  --all            上传默认 WAL 日志文件"
     echo "  --status         显示当前状态"
     echo "  --help           显示此帮助信息"
     echo ""
     echo "环境变量:"
     echo "  LOG_SERVER_URL   日志服务器地址 (默认: http://localhost:8080)"
+    echo "  WAL_LOG_FILE     WAL日志文件路径 (默认: /var/log/wal/wal.log)"
     echo ""
     echo "示例:"
     echo "  $0 --register                    # 首次使用，注册服务器"
-    echo "  $0 --all                         # 上传所有默认日志"
-    echo "  $0 /var/log/nginx/access.log     # 上传指定日志"
-    echo "  $0 --type app /var/log/myapp.log # 指定类型上传"
+    echo "  $0 /path/to/wal.log              # 上传 WAL 日志"
     echo "  $0 --daemon                      # 守护进程模式"
-    echo "  $0 --tail /var/log/syslog        # 实时跟踪"
+    echo "  $0 --tail /var/log/wal/wal.log   # 实时跟踪 WAL 日志"
     echo ""
-    echo "默认监控的日志文件:"
-    for entry in "${DEFAULT_LOGS[@]}"; do
-        local file="${entry%%:*}"
-        local type="${entry##*:}"
-        echo "  $file ($type)"
-    done
+    echo "WAL 日志格式:"
+    echo "  dump_stream_9_0_0:Wal record @ record end plsn:123; xid: (412, 12321);type:WAL_HEAP_UPDATE; ..."
+    echo ""
+    echo "默认监控的 WAL 日志文件:"
+    echo "  ${WAL_LOG_FILE}"
 }
 
 # 显示状态
@@ -476,11 +464,11 @@ show_status() {
 main() {
     check_dependencies
     init_state_dir
-    
-    local log_type="syslog"
+
+    local log_type="wal"  # 固定为 wal 类型
     local action=""
     local target_file=""
-    
+
     # 解析参数
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -495,10 +483,6 @@ main() {
             --tail)
                 action="tail"
                 target_file="$2"
-                shift 2
-                ;;
-            --type)
-                log_type="$2"
                 shift 2
                 ;;
             --all)

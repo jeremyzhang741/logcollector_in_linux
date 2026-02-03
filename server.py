@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Linux日志收集与分析平台 - 后端服务
-使用PostgreSQL存储，无认证模式
+WAL 日志收集与分析平台 - 后端服务
+支持大规模节点的高效上传和存储
 """
 
 import json
 import os
 import re
+import gzip
+import io
 from datetime import datetime, timedelta
 from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 from psycopg2 import pool
 
 # ==================== 配置 ====================
@@ -29,30 +32,30 @@ DB_CONFIG = {
 HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
 PORT = int(os.environ.get('SERVER_PORT', 8080))
 
+# 连接池配置（支持大规模并发）
+POOL_MIN_CONN = int(os.environ.get('POOL_MIN_CONN', 5))
+POOL_MAX_CONN = int(os.environ.get('POOL_MAX_CONN', 50))
+
 # 连接池
 db_pool = None
 
-# ==================== 日志解析 ====================
-LOG_LEVELS = {
-    'emerg': 0, 'alert': 1, 'crit': 2, 'err': 3, 'error': 3,
-    'warning': 4, 'warn': 4, 'notice': 5, 'info': 6, 'debug': 7
-}
-
-SYSLOG_PATTERN = re.compile(
-    r'^(?P<timestamp>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+'
-    r'(?P<hostname>\S+)\s+'
-    r'(?P<service>\S+?)(?:\[(?P<pid>\d+)\])?:\s+'
-    r'(?P<message>.*)$'
+# ==================== WAL 日志解析 ====================
+# WAL 日志格式解析
+# 格式: dump_stream_9_0_0:Wal record @ record end plsn:123; xid: (412, 12321);type:WAL_HEAP_INPLACE_UPDATE; len:122; ...
+WAL_LOG_PATTERN = re.compile(
+    r'^(?P<stream>\w+):Wal record @ record end plsn:(?P<plsn>\d+);\s*'
+    r'xid:\s*\((?P<xid_high>\d+),\s*(?P<xid_low>\d+)\);\s*'
+    r'type:(?P<wal_type>\w+);\s*'
+    r'len:(?P<len>\d+);\s*'
+    r'pageId=\((?P<page_id_1>\d+),(?P<page_id_2>\d+)\);\s*'
+    r'(?P<extra>.*)',
+    re.IGNORECASE
 )
 
-AUTH_LOG_PATTERN = re.compile(
-    r'(?P<action>Failed|Accepted|Invalid|session opened|session closed).*?'
-    r'(?:for\s+(?:invalid\s+)?user\s+)?(?P<user>\S+)?'
-    r'(?:\s+from\s+(?P<ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}))?'
-)
-
-KERNEL_PATTERN = re.compile(
-    r'\[\s*(?P<uptime>[\d.]+)\]\s*(?P<message>.*)'
+# 简化的 WAL 模式（更宽松的匹配）
+WAL_SIMPLE_PATTERN = re.compile(
+    r'^(?P<stream>\w+):.*type:(?P<wal_type>\w+);.*',
+    re.IGNORECASE
 )
 
 
@@ -71,23 +74,24 @@ def init_database():
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        
-        # 日志条目表
+
+        # WAL 日志条目表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS log_entries (
                 id SERIAL PRIMARY KEY,
                 server_id VARCHAR(64) NOT NULL,
                 hostname VARCHAR(255),
-                log_type VARCHAR(50) NOT NULL,
+                log_type VARCHAR(50) NOT NULL DEFAULT 'wal',
                 timestamp VARCHAR(100),
                 received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                level VARCHAR(20),
-                service VARCHAR(255),
-                pid INTEGER,
+                plsn TEXT,
+                xid TEXT,
+                type VARCHAR(128),
+                page_id TEXT,
                 message TEXT
             )
         ''')
-        
+
         # 服务器注册表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS servers (
@@ -100,13 +104,14 @@ def init_database():
                 total_logs BIGINT DEFAULT 0
             )
         ''')
-        
+
         # 创建索引
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_entries_server ON log_entries(server_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_entries_received ON log_entries(received_at)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_entries_level ON log_entries(level)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_entries_type ON log_entries(log_type)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_entries_message ON log_entries USING gin(to_tsvector(\'simple\', message))')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_entries_plsn ON log_entries(plsn)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_entries_xid ON log_entries(xid)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_entries_wal_type ON log_entries(type)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_entries_page_id ON log_entries(page_id)')
         
         conn.commit()
         print("✅ 数据库初始化完成")
@@ -119,46 +124,47 @@ def init_database():
         release_db_connection(conn)
 
 
-def parse_log_line(line, log_type):
-    """解析单行日志"""
+def parse_log_line(line, log_type='wal'):
+    """解析 WAL 日志行"""
     result = {
-        'level': 'info',
-        'service': None,
-        'pid': None,
-        'message': line,
-        'timestamp': None
+        'plsn': None,
+        'xid': None,
+        'type': None,
+        'page_id': None,
+        'message': line,  # 存储完整的原始日志
+        'timestamp': datetime.now().strftime('%b %d %H:%M:%S')
     }
 
-    # 尝试匹配syslog格式
-    match = SYSLOG_PATTERN.match(line)
-    if match:
+    # WAL 日志格式解析
+    wal_match = WAL_LOG_PATTERN.match(line)
+    if wal_match:
+        plsn = wal_match.group('plsn')
+        xid_high = wal_match.group('xid_high')
+        xid_low = wal_match.group('xid_low')
+        wal_type = wal_match.group('wal_type')
+        page_id_1 = wal_match.group('page_id_1')
+        page_id_2 = wal_match.group('page_id_2')
+
         result.update({
-            'timestamp': match.group('timestamp'),
-            'service': match.group('service'),
-            'pid': int(match.group('pid')) if match.group('pid') else None,
-            'message': match.group('message')
+            'plsn': plsn,
+            'xid': f"({xid_high},{xid_low})",
+            'type': wal_type,
+            'page_id': f"({page_id_1},{page_id_2})",
+            'message': line  # 完整原始日志
         })
 
-    # 检测日志级别
-    line_lower = line.lower()
-    for level, priority in sorted(LOG_LEVELS.items(), key=lambda x: x[1]):
-        if level in line_lower:
-            result['level'] = level if level not in ('err', 'warn') else ('error' if level == 'err' else 'warning')
-            break
+        return result
 
-    # 特殊日志类型解析
-    if log_type == 'auth':
-        auth_match = AUTH_LOG_PATTERN.search(line)
-        if auth_match:
-            # auth 日志检测失败情况
-            if 'failed' in line_lower or 'invalid' in line_lower:
-                result['level'] = 'warning'
+    # 尝试简化匹配提取 type
+    simple_match = WAL_SIMPLE_PATTERN.match(line)
+    if simple_match:
+        result.update({
+            'type': simple_match.group('wal_type'),
+            'message': line
+        })
+        return result
 
-    elif log_type == 'kern':
-        kern_match = KERNEL_PATTERN.search(line)
-        if kern_match:
-            result['message'] = kern_match.group('message')
-
+    # 无法匹配的日志，保持原样
     return result
 
 
@@ -217,77 +223,176 @@ class LogHandler(BaseHTTPRequestHandler):
             self.send_json({'error': 'Not Found'}, 404)
     
     def do_POST(self):
-        """处理POST请求"""
+        """处理POST请求（支持 gzip 压缩）"""
         parsed = urlparse(self.path)
         path = parsed.path
-        
+
         content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length).decode('utf-8')
-        
+        raw_body = self.rfile.read(content_length)
+
+        # 支持 gzip 压缩的请求体
+        content_encoding = self.headers.get('Content-Encoding', '')
+        if content_encoding == 'gzip':
+            try:
+                raw_body = gzip.decompress(raw_body)
+            except Exception as e:
+                self.send_json({'error': f'Gzip decompress failed: {e}'}, 400)
+                return
+
+        body = raw_body.decode('utf-8')
+
         try:
             data = json.loads(body) if body else {}
         except json.JSONDecodeError:
             self.send_json({'error': 'Invalid JSON'}, 400)
             return
-        
+
         routes = {
             '/api/upload': lambda: self.upload_logs(data),
+            '/api/upload/batch': lambda: self.upload_batch_logs(data),  # 批量上传多节点
             '/api/register': lambda: self.register_server(data),
         }
-        
+
         handler = routes.get(path)
         if handler:
             handler()
         else:
             self.send_json({'error': 'Not Found'}, 404)
-    
-    def upload_logs(self, data):
-        """接收并存储日志（无需认证）"""
-        server_id = data.get('server_id', 'unknown')
-        hostname = data.get('hostname', 'unknown')
-        log_type = data.get('log_type', 'syslog')
-        logs = data.get('logs', [])
-        
-        if not logs:
-            self.send_json({'error': 'No logs provided'}, 400)
+
+    def upload_batch_logs(self, data):
+        """批量上传多个节点的日志（一次请求包含多个节点）"""
+        nodes = data.get('nodes', [])
+        if not nodes:
+            self.send_json({'error': 'No nodes provided'}, 400)
             return
-        
+
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
-            
-            inserted = 0
+            total_inserted = 0
+            node_stats = {}
+
+            for node in nodes:
+                server_id = node.get('server_id', 'unknown')
+                hostname = node.get('hostname', 'unknown')
+                ip_address = node.get('ip', '')
+                log_type = node.get('log_type', 'wal')
+                logs = node.get('logs', [])
+
+                batch_data = []
+                stats = defaultdict(int)
+
+                for line in logs:
+                    if not line.strip():
+                        continue
+                    parsed = parse_log_line(line, log_type)
+                    batch_data.append((
+                        server_id, hostname, log_type,
+                        parsed['timestamp'], parsed['plsn'], parsed['xid'],
+                        parsed['type'], parsed['page_id'], parsed['message']
+                    ))
+                    if parsed['type']:
+                        stats[parsed['type']] += 1
+
+                if batch_data:
+                    execute_values(
+                        cursor,
+                        '''INSERT INTO log_entries
+                           (server_id, hostname, log_type, timestamp, plsn, xid, type, page_id, message)
+                           VALUES %s''',
+                        batch_data,
+                        page_size=1000
+                    )
+
+                inserted = len(batch_data)
+                total_inserted += inserted
+                node_stats[server_id] = {'inserted': inserted, 'stats': dict(stats)}
+
+                # 更新服务器记录
+                cursor.execute('''
+                    INSERT INTO servers (id, hostname, ip_address, last_seen, total_logs)
+                    VALUES (%s, %s, %s, CURRENT_TIMESTAMP, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        hostname = EXCLUDED.hostname,
+                        ip_address = COALESCE(EXCLUDED.ip_address, servers.ip_address),
+                        last_seen = CURRENT_TIMESTAMP,
+                        total_logs = servers.total_logs + EXCLUDED.total_logs
+                ''', (server_id, hostname, ip_address, inserted))
+
+            conn.commit()
+
+            self.send_json({
+                'success': True,
+                'total_inserted': total_inserted,
+                'nodes': len(nodes),
+                'node_stats': node_stats
+            })
+        except Exception as e:
+            conn.rollback()
+            self.send_json({'error': str(e)}, 500)
+        finally:
+            cursor.close()
+            release_db_connection(conn)
+    
+    def upload_logs(self, data):
+        """接收并存储 WAL 日志（批量插入优化）"""
+        server_id = data.get('server_id', 'unknown')
+        hostname = data.get('hostname', 'unknown')
+        ip_address = data.get('ip', '')
+        log_type = data.get('log_type', 'wal')
+        logs = data.get('logs', [])
+
+        if not logs:
+            self.send_json({'error': 'No logs provided'}, 400)
+            return
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+
+            # 准备批量插入数据
+            batch_data = []
             stats = defaultdict(int)
-            
+
             for line in logs:
                 if not line.strip():
                     continue
-                
-                parsed = parse_log_line(line, log_type)
 
-                cursor.execute('''
-                    INSERT INTO log_entries
-                    (server_id, hostname, log_type, timestamp, level, service, pid, message)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ''', (
+                parsed = parse_log_line(line, log_type)
+                batch_data.append((
                     server_id, hostname, log_type,
-                    parsed['timestamp'], parsed['level'], parsed['service'],
-                    parsed['pid'], parsed['message']
+                    parsed['timestamp'], parsed['plsn'], parsed['xid'],
+                    parsed['type'], parsed['page_id'], parsed['message']
                 ))
-                inserted += 1
-                stats[parsed['level']] += 1
-            
+                if parsed['type']:
+                    stats[parsed['type']] += 1
+
+            # 使用 execute_values 批量插入（比逐条插入快 10-100 倍）
+            if batch_data:
+                execute_values(
+                    cursor,
+                    '''INSERT INTO log_entries
+                       (server_id, hostname, log_type, timestamp, plsn, xid, type, page_id, message)
+                       VALUES %s''',
+                    batch_data,
+                    page_size=1000  # 每批 1000 条
+                )
+
+            inserted = len(batch_data)
+
             # 更新或插入服务器记录
             cursor.execute('''
-                INSERT INTO servers (id, hostname, last_seen, total_logs)
-                VALUES (%s, %s, CURRENT_TIMESTAMP, %s)
+                INSERT INTO servers (id, hostname, ip_address, last_seen, total_logs)
+                VALUES (%s, %s, %s, CURRENT_TIMESTAMP, %s)
                 ON CONFLICT (id) DO UPDATE SET
+                    hostname = EXCLUDED.hostname,
+                    ip_address = COALESCE(EXCLUDED.ip_address, servers.ip_address),
                     last_seen = CURRENT_TIMESTAMP,
                     total_logs = servers.total_logs + EXCLUDED.total_logs
-            ''', (server_id, hostname, inserted))
-            
+            ''', (server_id, hostname, ip_address, inserted))
+
             conn.commit()
-            
+
             self.send_json({
                 'success': True,
                 'inserted': inserted,
@@ -340,71 +445,61 @@ class LogHandler(BaseHTTPRequestHandler):
             release_db_connection(conn)
     
     def get_stats(self, params):
-        """获取统计数据"""
+        """获取 WAL 日志统计数据"""
         hours = int(params.get('hours', ['24'])[0])
-        
+
         conn = get_db_connection()
         try:
             cursor = conn.cursor(cursor_factory=RealDictCursor)
-            
+
             # 总体统计
             cursor.execute('''
-                SELECT 
+                SELECT
                     COUNT(*) as total,
                     COUNT(DISTINCT server_id) as servers,
-                    COUNT(DISTINCT log_type) as log_types
-                FROM log_entries 
+                    COUNT(DISTINCT type) as wal_types
+                FROM log_entries
                 WHERE received_at > NOW() - INTERVAL '%s hours'
             ''', (hours,))
             overview = cursor.fetchone()
-            
-            # 按级别统计
+
+            # 按 WAL 类型统计
             cursor.execute('''
-                SELECT level, COUNT(*) as count 
-                FROM log_entries 
-                WHERE received_at > NOW() - INTERVAL '%s hours'
-                GROUP BY level ORDER BY count DESC
+                SELECT type, COUNT(*) as count
+                FROM log_entries
+                WHERE received_at > NOW() - INTERVAL '%s hours' AND type IS NOT NULL
+                GROUP BY type ORDER BY count DESC
             ''', (hours,))
-            by_level = {row['level']: row['count'] for row in cursor.fetchall()}
-            
-            # 按类型统计
-            cursor.execute('''
-                SELECT log_type, COUNT(*) as count 
-                FROM log_entries 
-                WHERE received_at > NOW() - INTERVAL '%s hours'
-                GROUP BY log_type ORDER BY count DESC
-            ''', (hours,))
-            by_type = {row['log_type']: row['count'] for row in cursor.fetchall()}
-            
+            by_wal_type = {row['type']: row['count'] for row in cursor.fetchall()}
+
             # 按服务器统计
             cursor.execute('''
-                SELECT server_id, hostname, COUNT(*) as count 
-                FROM log_entries 
+                SELECT server_id, hostname, COUNT(*) as count
+                FROM log_entries
                 WHERE received_at > NOW() - INTERVAL '%s hours'
                 GROUP BY server_id, hostname ORDER BY count DESC LIMIT 10
             ''', (hours,))
-            by_server = [{'id': r['server_id'], 'hostname': r['hostname'], 'count': r['count']} 
+            by_server = [{'id': r['server_id'], 'hostname': r['hostname'], 'count': r['count']}
                         for r in cursor.fetchall()]
-            
-            # 按服务统计
+
+            # 按 pageId 统计（Top 10）
             cursor.execute('''
-                SELECT service, COUNT(*) as count 
-                FROM log_entries 
-                WHERE received_at > NOW() - INTERVAL '%s hours' AND service IS NOT NULL
-                GROUP BY service ORDER BY count DESC LIMIT 10
+                SELECT page_id, COUNT(*) as count
+                FROM log_entries
+                WHERE received_at > NOW() - INTERVAL '%s hours' AND page_id IS NOT NULL
+                GROUP BY page_id ORDER BY count DESC LIMIT 10
             ''', (hours,))
-            by_service = {row['service']: row['count'] for row in cursor.fetchall()}
-            
+            by_page_id = {row['page_id']: row['count'] for row in cursor.fetchall()}
+
             self.send_json({
                 'overview': {
                     'total_logs': overview['total'],
                     'active_servers': overview['servers'],
-                    'log_types': overview['log_types']
+                    'wal_types': overview['wal_types']
                 },
-                'by_level': by_level,
-                'by_type': by_type,
+                'by_wal_type': by_wal_type,
                 'by_server': by_server,
-                'by_service': by_service,
+                'by_page_id': by_page_id,
                 'period_hours': hours
             })
         except Exception as e:
@@ -414,46 +509,72 @@ class LogHandler(BaseHTTPRequestHandler):
             release_db_connection(conn)
     
     def get_logs(self, params):
-        """查询日志"""
+        """查询 WAL 日志"""
         conn = get_db_connection()
         try:
             cursor = conn.cursor(cursor_factory=RealDictCursor)
-            
+
             # 构建查询
             conditions = ['1=1']
             values = []
-            
+            use_join = False
+
             if 'server_id' in params:
-                conditions.append('server_id = %s')
+                conditions.append('l.server_id = %s')
                 values.append(params['server_id'][0])
-            
-            if 'level' in params:
-                conditions.append('level = %s')
-                values.append(params['level'][0])
-            
-            if 'log_type' in params:
-                conditions.append('log_type = %s')
-                values.append(params['log_type'][0])
-            
+
+            if 'type' in params:
+                conditions.append('l.type = %s')
+                values.append(params['type'][0])
+
+            if 'plsn' in params:
+                conditions.append('l.plsn = %s')
+                values.append(params['plsn'][0])
+
+            if 'xid' in params:
+                conditions.append('l.xid = %s')
+                values.append(params['xid'][0])
+
             if 'search' in params:
-                conditions.append('message ILIKE %s')
-                values.append(f"%{params['search'][0]}%")
-            
+                search_term = params['search'][0]
+                # 搜索 server_id, hostname, ip_address 或 message
+                conditions.append('''(
+                    l.server_id ILIKE %s OR
+                    l.hostname ILIKE %s OR
+                    l.message ILIKE %s OR
+                    s.ip_address ILIKE %s
+                )''')
+                search_pattern = f"%{search_term}%"
+                values.extend([search_pattern, search_pattern, search_pattern, search_pattern])
+                use_join = True
+
             if 'since' in params:
-                conditions.append('received_at > %s')
+                conditions.append('l.received_at > %s')
                 values.append(params['since'][0])
-            
+
             limit = min(int(params.get('limit', ['100'])[0]), 1000)
             offset = int(params.get('offset', ['0'])[0])
-            
-            query = f'''
-                SELECT id, server_id, hostname, log_type, timestamp, received_at,
-                       level, service, message
-                FROM log_entries
-                WHERE {' AND '.join(conditions)}
-                ORDER BY received_at DESC
-                LIMIT %s OFFSET %s
-            '''
+
+            # 根据是否需要 JOIN 构建不同的查询
+            if use_join:
+                query = f'''
+                    SELECT DISTINCT l.id, l.server_id, l.hostname, l.log_type, l.timestamp, l.received_at,
+                           l.plsn, l.xid, l.type, l.page_id, l.message
+                    FROM log_entries l
+                    LEFT JOIN servers s ON l.server_id = s.id
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY l.received_at DESC
+                    LIMIT %s OFFSET %s
+                '''
+            else:
+                query = f'''
+                    SELECT id, server_id, hostname, log_type, timestamp, received_at,
+                           plsn, xid, type, page_id, message
+                    FROM log_entries l
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY received_at DESC
+                    LIMIT %s OFFSET %s
+                '''
 
             cursor.execute(query, values + [limit, offset])
 
@@ -466,18 +587,28 @@ class LogHandler(BaseHTTPRequestHandler):
                     'log_type': row['log_type'],
                     'timestamp': row['timestamp'],
                     'received_at': row['received_at'],
-                    'level': row['level'],
-                    'service': row['service'],
+                    'plsn': row['plsn'],
+                    'xid': row['xid'],
+                    'type': row['type'],
+                    'page_id': row['page_id'],
                     'message': row['message']
                 })
-            
+
             # 获取总数
-            count_query = f'''
-                SELECT COUNT(*) as total FROM log_entries WHERE {' AND '.join(conditions)}
-            '''
+            if use_join:
+                count_query = f'''
+                    SELECT COUNT(DISTINCT l.id) as total
+                    FROM log_entries l
+                    LEFT JOIN servers s ON l.server_id = s.id
+                    WHERE {' AND '.join(conditions)}
+                '''
+            else:
+                count_query = f'''
+                    SELECT COUNT(*) as total FROM log_entries l WHERE {' AND '.join(conditions)}
+                '''
             cursor.execute(count_query, values)
             total = cursor.fetchone()['total']
-            
+
             self.send_json({
                 'logs': logs,
                 'total': total,
@@ -554,23 +685,23 @@ class LogHandler(BaseHTTPRequestHandler):
             release_db_connection(conn)
     
     def get_alerts(self, params):
-        """获取告警（错误和警告）"""
+        """获取告警（危险的 WAL 操作：DELETE、TRUNCATE、ABORT 等）"""
         hours = int(params.get('hours', ['24'])[0])
-        
+
         conn = get_db_connection()
         try:
             cursor = conn.cursor(cursor_factory=RealDictCursor)
-            
+
             cursor.execute('''
-                SELECT id, server_id, hostname, log_type, timestamp, received_at, 
-                       level, service, message
-                FROM log_entries 
-                WHERE level IN ('error', 'crit', 'alert', 'emerg', 'warning')
+                SELECT id, server_id, hostname, log_type, timestamp, received_at,
+                       plsn, xid, type, page_id, message
+                FROM log_entries
+                WHERE type ILIKE ANY(ARRAY['%%DELETE%%', '%%TRUNCATE%%', '%%ABORT%%', '%%ERROR%%'])
                 AND received_at > NOW() - INTERVAL '%s hours'
                 ORDER BY received_at DESC
                 LIMIT 100
             ''', (hours,))
-            
+
             alerts = []
             for row in cursor.fetchall():
                 alerts.append({
@@ -580,11 +711,13 @@ class LogHandler(BaseHTTPRequestHandler):
                     'log_type': row['log_type'],
                     'timestamp': row['timestamp'],
                     'received_at': row['received_at'],
-                    'level': row['level'],
-                    'service': row['service'],
+                    'plsn': row['plsn'],
+                    'xid': row['xid'],
+                    'type': row['type'],
+                    'page_id': row['page_id'],
                     'message': row['message']
                 })
-            
+
             self.send_json({'alerts': alerts})
         except Exception as e:
             self.send_json({'error': str(e)}, 500)
@@ -604,18 +737,24 @@ class LogHandler(BaseHTTPRequestHandler):
             self.send_html('<h1>Dashboard not found</h1><p>Please ensure dashboard.html is in the same directory.</p>', 404)
 
 
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """支持多线程的 HTTP 服务器，用于处理并发请求"""
+    daemon_threads = True
+
+
 def main():
     """主入口"""
     global db_pool
-    
-    print("🚀 启动日志分析平台...")
+
+    print("🚀 启动 WAL 日志分析平台...")
     print(f"📦 数据库: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
-    
-    # 创建数据库连接池
+    print(f"🔗 连接池: {POOL_MIN_CONN} - {POOL_MAX_CONN} 连接")
+
+    # 创建数据库连接池（支持大规模并发）
     try:
         db_pool = pool.ThreadedConnectionPool(
-            minconn=2,
-            maxconn=10,
+            minconn=POOL_MIN_CONN,
+            maxconn=POOL_MAX_CONN,
             **DB_CONFIG
         )
         print("✅ 数据库连接池创建成功")
@@ -624,18 +763,20 @@ def main():
         print("\n请确保PostgreSQL正在运行，并设置以下环境变量：")
         print("  DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD")
         return
-    
+
     # 初始化数据库表
     init_database()
-    
-    # 启动HTTP服务器
-    server = HTTPServer((HOST, PORT), LogHandler)
-    print(f"\n✅ 服务器启动成功")
+
+    # 启动多线程 HTTP 服务器
+    server = ThreadedHTTPServer((HOST, PORT), LogHandler)
+    print(f"\n✅ 服务器启动成功（多线程模式）")
     print(f"📊 访问仪表板: http://localhost:{PORT}/dashboard")
-    print(f"📤 日志上传: POST http://localhost:{PORT}/api/upload")
+    print(f"📤 单节点上传: POST http://localhost:{PORT}/api/upload")
+    print(f"📤 批量上传:   POST http://localhost:{PORT}/api/upload/batch")
     print(f"🖥️  服务器注册: POST http://localhost:{PORT}/api/register")
-    print("\n⚠️  注意: 已禁用API密钥认证，请确保网络安全\n")
-    
+    print(f"\n💡 支持 gzip 压缩上传（Content-Encoding: gzip）")
+    print("⚠️  注意: 已禁用API密钥认证，请确保网络安全\n")
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
