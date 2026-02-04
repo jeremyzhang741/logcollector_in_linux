@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>日志分析平台 | LogVista</title>
+    <title>WAL 日志分析平台</title>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -17,77 +17,30 @@
             --accent-green: #00ff88;
             --accent-red: #ff4757;
             --accent-orange: #ff8c42;
+            --accent-blue: #4a90d9;
             --text-primary: #ffffff;
             --text-secondary: #8888aa;
             --text-muted: #555566;
             --border-color: #2a2a3a;
-            --glow-cyan: 0 0 20px rgba(0, 212, 255, 0.3);
-            --glow-magenta: 0 0 20px rgba(255, 0, 212, 0.3);
         }
 
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
 
         body {
             font-family: 'Space Grotesk', sans-serif;
             background: var(--bg-primary);
             color: var(--text-primary);
             min-height: 100vh;
-            overflow-x: hidden;
         }
 
-        /* 背景网格效果 */
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-image: 
-                linear-gradient(rgba(0, 212, 255, 0.03) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(0, 212, 255, 0.03) 1px, transparent 1px);
-            background-size: 50px 50px;
-            pointer-events: none;
-            z-index: -1;
-        }
-
-        /* 渐变光晕 */
-        .glow-orb {
-            position: fixed;
-            width: 600px;
-            height: 600px;
-            border-radius: 50%;
-            filter: blur(100px);
-            opacity: 0.15;
-            pointer-events: none;
-            z-index: -1;
-        }
-
-        .glow-orb-1 {
-            top: -200px;
-            right: -200px;
-            background: var(--accent-cyan);
-        }
-
-        .glow-orb-2 {
-            bottom: -200px;
-            left: -200px;
-            background: var(--accent-magenta);
-        }
-
-        /* 头部导航 */
+        /* 头部 */
         header {
-            padding: 1.5rem 3rem;
+            padding: 1rem 2rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
             border-bottom: 1px solid var(--border-color);
-            background: rgba(10, 10, 15, 0.8);
-            backdrop-filter: blur(20px);
+            background: rgba(10, 10, 15, 0.95);
             position: sticky;
             top: 0;
             z-index: 100;
@@ -96,321 +49,10 @@
         .logo {
             display: flex;
             align-items: center;
-            gap: 1rem;
-        }
-
-        .logo-icon {
-            width: 48px;
-            height: 48px;
-            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-magenta));
-            border-radius: 12px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 1.5rem;
-            box-shadow: var(--glow-cyan);
-        }
-
-        .logo-text {
-            font-size: 1.5rem;
-            font-weight: 700;
-            background: linear-gradient(90deg, var(--accent-cyan), var(--accent-magenta));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            letter-spacing: -0.5px;
-        }
-
-        .header-actions {
-            display: flex;
-            gap: 1rem;
-            align-items: center;
-        }
-
-        .status-indicator {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.5rem 1rem;
-            background: var(--bg-tertiary);
-            border-radius: 20px;
-            font-size: 0.85rem;
-        }
-
-        .status-dot {
-            width: 8px;
-            height: 8px;
-            background: var(--accent-green);
-            border-radius: 50%;
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; box-shadow: 0 0 10px var(--accent-green); }
-            50% { opacity: 0.5; box-shadow: none; }
-        }
-
-        .btn {
-            padding: 0.75rem 1.5rem;
-            border: none;
-            border-radius: 8px;
-            font-family: inherit;
-            font-size: 0.9rem;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .btn-primary {
-            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-magenta));
-            color: white;
-        }
-
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: var(--glow-cyan);
-        }
-
-        .btn-secondary {
-            background: var(--bg-tertiary);
-            color: var(--text-primary);
-            border: 1px solid var(--border-color);
-        }
-
-        .btn-secondary:hover {
-            border-color: var(--accent-cyan);
-        }
-
-        /* 主内容区 */
-        main {
-            padding: 2rem 3rem;
-            max-width: 1800px;
-            margin: 0 auto;
-        }
-
-        /* 统计卡片网格 */
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 1.5rem;
-            margin-bottom: 2rem;
-        }
-
-        .stat-card {
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 1.5rem;
-            position: relative;
-            overflow: hidden;
-            transition: all 0.3s ease;
-        }
-
-        .stat-card:hover {
-            border-color: var(--accent-cyan);
-            transform: translateY(-4px);
-        }
-
-        .stat-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 3px;
-            background: linear-gradient(90deg, var(--accent-cyan), var(--accent-magenta));
-        }
-
-        .stat-card.warning::before {
-            background: var(--accent-orange);
-        }
-
-        .stat-card.error::before {
-            background: var(--accent-red);
-        }
-
-        .stat-card.success::before {
-            background: var(--accent-green);
-        }
-
-        .stat-label {
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            margin-bottom: 0.5rem;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-
-        .stat-value {
-            font-size: 2.5rem;
-            font-weight: 700;
-            font-family: 'JetBrains Mono', monospace;
-            background: linear-gradient(90deg, var(--text-primary), var(--text-secondary));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-
-        .stat-change {
-            font-size: 0.8rem;
-            margin-top: 0.5rem;
-            display: flex;
-            align-items: center;
-            gap: 0.25rem;
-        }
-
-        .stat-change.up { color: var(--accent-green); }
-        .stat-change.down { color: var(--accent-red); }
-
-        /* 主要内容区域 */
-        .content-grid {
-            display: grid;
-            grid-template-columns: 2fr 1fr;
-            gap: 1.5rem;
-        }
-
-        .panel {
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            overflow: hidden;
-        }
-
-        .panel-header {
-            padding: 1.25rem 1.5rem;
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .panel-title {
-            font-size: 1.1rem;
-            font-weight: 600;
-            display: flex;
-            align-items: center;
             gap: 0.75rem;
         }
 
-        .panel-title-icon {
-            width: 32px;
-            height: 32px;
-            background: var(--bg-tertiary);
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        /* 日志列表 */
-        .log-list {
-            max-height: 600px;
-            overflow-y: auto;
-        }
-
-        .log-list::-webkit-scrollbar {
-            width: 6px;
-        }
-
-        .log-list::-webkit-scrollbar-track {
-            background: var(--bg-secondary);
-        }
-
-        .log-list::-webkit-scrollbar-thumb {
-            background: var(--border-color);
-            border-radius: 3px;
-        }
-
-        .log-entry {
-            padding: 1rem 1.5rem;
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            gap: 1rem;
-            transition: background 0.2s;
-            cursor: pointer;
-        }
-
-        .log-entry:hover {
-            background: var(--bg-tertiary);
-        }
-
-        .log-level {
-            width: 70px;
-            padding: 0.25rem 0.5rem;
-            border-radius: 4px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            text-align: center;
-            font-family: 'JetBrains Mono', monospace;
-            flex-shrink: 0;
-        }
-
-        .log-level.error, .log-level.crit, .log-level.alert, .log-level.emerg {
-            background: rgba(255, 71, 87, 0.2);
-            color: var(--accent-red);
-        }
-
-        .log-level.warning, .log-level.warn {
-            background: rgba(255, 208, 0, 0.2);
-            color: var(--accent-yellow);
-        }
-
-        .log-level.info, .log-level.notice {
-            background: rgba(0, 212, 255, 0.2);
-            color: var(--accent-cyan);
-        }
-
-        .log-level.debug {
-            background: rgba(136, 136, 170, 0.2);
-            color: var(--text-secondary);
-        }
-
-        .log-content {
-            flex: 1;
-            min-width: 0;
-        }
-
-        .log-message {
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.85rem;
-            color: var(--text-primary);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            margin-bottom: 0.5rem;
-        }
-
-        .log-meta {
-            display: flex;
-            gap: 1.5rem;
-            font-size: 0.75rem;
-            color: var(--text-muted);
-        }
-
-        .log-meta span {
-            display: flex;
-            align-items: center;
-            gap: 0.25rem;
-        }
-
-        /* 服务器列表 */
-        .server-item {
-            padding: 1rem 1.5rem;
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .server-info {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-        }
-
-        .server-avatar {
+        .logo-icon {
             width: 40px;
             height: 40px;
             background: linear-gradient(135deg, var(--accent-cyan), var(--accent-magenta));
@@ -421,201 +63,380 @@
             font-size: 1.2rem;
         }
 
-        .server-name {
-            font-weight: 600;
+        .logo-text {
+            font-size: 1.3rem;
+            font-weight: 700;
+            background: linear-gradient(90deg, var(--accent-cyan), var(--accent-magenta));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
 
-        .server-id {
-            font-size: 0.75rem;
-            color: var(--text-muted);
-            font-family: 'JetBrains Mono', monospace;
-        }
-
-        .server-stats {
-            text-align: right;
-        }
-
-        .server-logs {
-            font-size: 1.1rem;
-            font-weight: 600;
-            font-family: 'JetBrains Mono', monospace;
-        }
-
-        .server-status {
-            font-size: 0.75rem;
-            color: var(--accent-green);
-        }
-
-        /* 图表区域 */
-        .chart-container {
-            padding: 1.5rem;
-            height: 300px;
-        }
-
-        /* 搜索和过滤 */
-        .search-bar {
+        .header-controls {
             display: flex;
             gap: 1rem;
-            margin-bottom: 1.5rem;
+            align-items: center;
         }
 
-        .search-input {
-            flex: 1;
-            padding: 1rem 1.5rem;
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            color: var(--text-primary);
-            font-family: inherit;
-            font-size: 0.95rem;
-            transition: all 0.3s ease;
+        /* 主布局 */
+        .main-layout {
+            display: grid;
+            grid-template-columns: 280px 1fr;
+            min-height: calc(100vh - 60px);
         }
 
-        .search-input:focus {
-            outline: none;
-            border-color: var(--accent-cyan);
-            box-shadow: var(--glow-cyan);
+        /* 侧边栏 */
+        .sidebar {
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border-color);
+            padding: 1.5rem;
+            overflow-y: auto;
         }
 
-        .search-input::placeholder {
+        .sidebar-section {
+            margin-bottom: 2rem;
+        }
+
+        .sidebar-title {
+            font-size: 0.75rem;
             color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 1rem;
         }
 
-        .filter-group {
+        .server-list {
             display: flex;
+            flex-direction: column;
             gap: 0.5rem;
         }
 
-        .filter-btn {
+        .server-item {
             padding: 0.75rem 1rem;
             background: var(--bg-tertiary);
             border: 1px solid var(--border-color);
             border-radius: 8px;
-            color: var(--text-secondary);
-            font-family: inherit;
-            font-size: 0.85rem;
             cursor: pointer;
             transition: all 0.2s;
         }
 
-        .filter-btn:hover, .filter-btn.active {
-            background: var(--accent-cyan);
-            color: var(--bg-primary);
+        .server-item:hover, .server-item.active {
             border-color: var(--accent-cyan);
+            background: rgba(0, 212, 255, 0.1);
         }
 
-        /* 服务器选择器 */
-        .server-selector {
-            min-width: 200px;
-            padding: 1rem 1.5rem;
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            color: var(--text-primary);
-            font-family: inherit;
-            font-size: 0.95rem;
-            cursor: pointer;
-            transition: all 0.3s ease;
+        .server-item.active {
+            box-shadow: 0 0 10px rgba(0, 212, 255, 0.2);
         }
 
-        .server-selector:focus {
-            outline: none;
-            border-color: var(--accent-cyan);
-            box-shadow: var(--glow-cyan);
+        .server-name {
+            font-weight: 600;
+            font-size: 0.9rem;
+            margin-bottom: 0.25rem;
         }
 
-        .server-selector option {
-            background: var(--bg-card);
-            color: var(--text-primary);
+        .server-meta {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            display: flex;
+            justify-content: space-between;
         }
 
-        /* 底部区域 */
-        .bottom-grid {
+        /* 统计卡片 */
+        .stats-mini {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 1.5rem;
-            margin-top: 1.5rem;
-        }
-
-        /* 级别分布图表 */
-        .level-chart {
-            display: flex;
-            flex-direction: column;
+            grid-template-columns: 1fr 1fr;
             gap: 0.75rem;
-            padding: 1.5rem;
         }
 
-        .level-bar {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-        }
-
-        .level-label {
-            width: 80px;
-            font-size: 0.8rem;
-            text-transform: uppercase;
-            color: var(--text-secondary);
-        }
-
-        .level-bar-bg {
-            flex: 1;
-            height: 24px;
+        .stat-mini {
             background: var(--bg-tertiary);
-            border-radius: 4px;
-            overflow: hidden;
-            position: relative;
+            padding: 0.75rem;
+            border-radius: 8px;
+            text-align: center;
         }
 
-        .level-bar-fill {
-            height: 100%;
-            border-radius: 4px;
-            transition: width 0.5s ease;
-        }
-
-        .level-bar-fill.error { background: linear-gradient(90deg, var(--accent-red), #ff6b7a); }
-        .level-bar-fill.warning { background: linear-gradient(90deg, var(--accent-orange), var(--accent-yellow)); }
-        .level-bar-fill.info { background: linear-gradient(90deg, var(--accent-cyan), #4de8ff); }
-        .level-bar-fill.debug { background: linear-gradient(90deg, #666, #888); }
-
-        .level-count {
-            width: 60px;
-            text-align: right;
+        .stat-mini-value {
+            font-size: 1.25rem;
+            font-weight: 700;
             font-family: 'JetBrains Mono', monospace;
-            font-size: 0.85rem;
+            color: var(--accent-cyan);
         }
 
-        /* 时间范围选择器 */
-        .time-selector {
+        .stat-mini-label {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            margin-top: 0.25rem;
+        }
+
+        /* 主内容区 */
+        .main-content {
+            padding: 1.5rem;
+            overflow-y: auto;
+        }
+
+        /* 视图切换 */
+        .view-tabs {
             display: flex;
             gap: 0.5rem;
-            background: var(--bg-tertiary);
+            margin-bottom: 1.5rem;
+            background: var(--bg-secondary);
             padding: 0.25rem;
             border-radius: 8px;
+            width: fit-content;
         }
 
-        .time-btn {
-            padding: 0.5rem 1rem;
+        .view-tab {
+            padding: 0.6rem 1.2rem;
             background: transparent;
             border: none;
             border-radius: 6px;
             color: var(--text-secondary);
             font-family: inherit;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .view-tab:hover { color: var(--text-primary); }
+        .view-tab.active {
+            background: var(--accent-cyan);
+            color: var(--bg-primary);
+        }
+
+        /* 过滤器区 */
+        .filters {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .filter-group {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .filter-label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .filter-input, .filter-select {
+            padding: 0.5rem 1rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.85rem;
+        }
+
+        .filter-input:focus, .filter-select:focus {
+            outline: none;
+            border-color: var(--accent-cyan);
+        }
+
+        .filter-input { width: 180px; }
+
+        .btn {
+            padding: 0.5rem 1rem;
+            border: none;
+            border-radius: 6px;
+            font-family: inherit;
             font-size: 0.85rem;
             cursor: pointer;
             transition: all 0.2s;
         }
 
-        .time-btn:hover, .time-btn.active {
+        .btn-primary {
             background: var(--accent-cyan);
             color: var(--bg-primary);
         }
 
-        /* 加载动画 */
-        .loading {
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+        }
+
+        .btn:hover { opacity: 0.9; transform: translateY(-1px); }
+
+        /* WAL 日志表格 */
+        .wal-table-container {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .wal-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+
+        .wal-table th {
+            background: var(--bg-tertiary);
+            padding: 1rem;
+            text-align: left;
+            font-weight: 600;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border-color);
+            position: sticky;
+            top: 0;
+            cursor: pointer;
+        }
+
+        .wal-table th:hover { color: var(--accent-cyan); }
+
+        .wal-table td {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+            font-family: 'JetBrains Mono', monospace;
+            vertical-align: top;
+        }
+
+        .wal-table tr:hover { background: var(--bg-tertiary); }
+
+        .wal-type {
+            display: inline-block;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .wal-type.update { background: rgba(0, 212, 255, 0.2); color: var(--accent-cyan); }
+        .wal-type.insert { background: rgba(0, 255, 136, 0.2); color: var(--accent-green); }
+        .wal-type.delete { background: rgba(255, 71, 87, 0.2); color: var(--accent-red); }
+        .wal-type.other { background: rgba(136, 136, 170, 0.2); color: var(--text-secondary); }
+
+        .clickable {
+            color: var(--accent-cyan);
+            cursor: pointer;
+            text-decoration: underline;
+        }
+
+        .clickable:hover { color: var(--accent-magenta); }
+
+        /* 分组视图 */
+        .group-view {
+            display: grid;
+            gap: 1rem;
+        }
+
+        .group-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .group-header {
+            padding: 1rem 1.5rem;
+            background: var(--bg-tertiary);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+        }
+
+        .group-header:hover { background: rgba(0, 212, 255, 0.1); }
+
+        .group-title {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 600;
+        }
+
+        .group-count {
+            background: var(--accent-cyan);
+            color: var(--bg-primary);
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .group-body {
+            display: none;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .group-card.expanded .group-body { display: block; }
+
+        .group-item {
+            padding: 0.75rem 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+        }
+
+        .group-item:last-child { border-bottom: none; }
+
+        /* 日志详情 */
+        .log-detail-row {
+            display: grid;
+            grid-template-columns: 120px 1fr;
+            gap: 0.5rem;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .log-detail-label {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }
+
+        .log-detail-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            word-break: break-all;
+        }
+
+        /* 分页 */
+        .pagination {
             display: flex;
             justify-content: center;
             align-items: center;
+            gap: 0.5rem;
+            margin-top: 1.5rem;
+        }
+
+        .page-btn {
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-primary);
+            cursor: pointer;
+        }
+
+        .page-btn:hover { border-color: var(--accent-cyan); }
+        .page-btn.active { background: var(--accent-cyan); color: var(--bg-primary); }
+        .page-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .page-info {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            margin: 0 1rem;
+        }
+
+        /* 空状态 */
+        .empty-state {
+            text-align: center;
+            padding: 4rem 2rem;
+            color: var(--text-muted);
+        }
+
+        .empty-icon { font-size: 3rem; margin-bottom: 1rem; }
+
+        /* 加载状态 */
+        .loading {
+            display: flex;
+            justify-content: center;
             padding: 3rem;
         }
 
@@ -628,61 +449,7 @@
             animation: spin 1s linear infinite;
         }
 
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        /* 空状态 */
-        .empty-state {
-            text-align: center;
-            padding: 3rem;
-            color: var(--text-muted);
-        }
-
-        .empty-state-icon {
-            font-size: 3rem;
-            margin-bottom: 1rem;
-        }
-
-        /* 响应式 */
-        @media (max-width: 1200px) {
-            .stats-grid {
-                grid-template-columns: repeat(2, 1fr);
-            }
-            .content-grid {
-                grid-template-columns: 1fr;
-            }
-            .bottom-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-
-        @media (max-width: 768px) {
-            header {
-                padding: 1rem;
-                flex-direction: column;
-                gap: 1rem;
-            }
-            main {
-                padding: 1rem;
-            }
-            .stats-grid {
-                grid-template-columns: 1fr;
-            }
-            .search-bar {
-                flex-direction: column;
-            }
-        }
-
-        /* 趋势图样式 */
-        .trend-chart {
-            padding: 1.5rem;
-        }
-
-        .trend-canvas {
-            width: 100%;
-            height: 200px;
-        }
+        @keyframes spin { to { transform: rotate(360deg); } }
 
         /* Modal */
         .modal-overlay {
@@ -698,27 +465,27 @@
             z-index: 1000;
         }
 
-        .modal-overlay.active {
-            display: flex;
-        }
+        .modal-overlay.active { display: flex; }
 
         .modal {
             background: var(--bg-card);
             border: 1px solid var(--border-color);
             border-radius: 16px;
             width: 90%;
-            max-width: 600px;
+            max-width: 800px;
             max-height: 80vh;
             overflow: hidden;
         }
 
         .modal-header {
-            padding: 1.5rem;
+            padding: 1.25rem 1.5rem;
             border-bottom: 1px solid var(--border-color);
             display: flex;
             justify-content: space-between;
             align-items: center;
         }
+
+        .modal-title { font-size: 1.1rem; font-weight: 600; }
 
         .modal-close {
             background: none;
@@ -734,479 +501,473 @@
             max-height: 60vh;
         }
 
-        .modal-body pre {
+        .raw-log {
             background: var(--bg-tertiary);
             padding: 1rem;
             border-radius: 8px;
-            overflow-x: auto;
             font-family: 'JetBrains Mono', monospace;
-            font-size: 0.85rem;
-            line-height: 1.6;
+            font-size: 0.8rem;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            margin-top: 1rem;
+        }
+
+        /* 响应式 */
+        @media (max-width: 1024px) {
+            .main-layout { grid-template-columns: 1fr; }
+            .sidebar { display: none; }
         }
     </style>
 </head>
 <body>
-    <div class="glow-orb glow-orb-1"></div>
-    <div class="glow-orb glow-orb-2"></div>
-
     <header>
         <div class="logo">
             <div class="logo-icon">📊</div>
-            <span class="logo-text">LogVista</span>
+            <span class="logo-text">WAL 日志分析平台</span>
         </div>
-        <div class="header-actions">
-            <div class="status-indicator">
-                <span class="status-dot"></span>
-                <span>实时监控中</span>
-            </div>
-            <div class="time-selector">
-                <button class="time-btn active" data-hours="1">1小时</button>
-                <button class="time-btn" data-hours="6">6小时</button>
-                <button class="time-btn" data-hours="24">24小时</button>
-                <button class="time-btn" data-hours="168">7天</button>
-            </div>
-            <button class="btn btn-secondary" onclick="refreshData()">🔄 刷新</button>
+        <div class="header-controls">
+            <select class="filter-select" id="mobile-server-select" style="display: none;">
+                <option value="">选择服务器</option>
+            </select>
+            <button class="btn btn-secondary" onclick="refreshData()">刷新</button>
         </div>
     </header>
 
-    <main>
-        <!-- 统计卡片 -->
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">总日志数</div>
-                <div class="stat-value" id="total-logs">-</div>
-                <div class="stat-change up" id="logs-change">
-                    <span>↑</span> 加载中...
-                </div>
-            </div>
-            <div class="stat-card success">
-                <div class="stat-label">活跃服务器</div>
-                <div class="stat-value" id="active-servers">-</div>
-                <div class="stat-change" style="color: var(--text-muted);">
-                    在线运行
-                </div>
-            </div>
-            <div class="stat-card warning">
-                <div class="stat-label">警告数量</div>
-                <div class="stat-value" id="warning-count">-</div>
-                <div class="stat-change" id="warning-change">
-                    待处理
-                </div>
-            </div>
-            <div class="stat-card error">
-                <div class="stat-label">错误数量</div>
-                <div class="stat-value" id="error-count">-</div>
-                <div class="stat-change" id="error-change">
-                    需关注
-                </div>
-            </div>
-        </div>
-
-        <!-- 搜索栏 -->
-        <div class="search-bar">
-            <select class="server-selector" id="server-selector">
-                <option value="all">所有服务器</option>
-            </select>
-            <input type="text" class="search-input" id="search-input" placeholder="搜索日志内容、服务名称、主机名...">
-            <div class="filter-group">
-                <button class="filter-btn active" data-level="all">全部</button>
-                <button class="filter-btn" data-level="error">错误</button>
-                <button class="filter-btn" data-level="warning">警告</button>
-                <button class="filter-btn" data-level="info">信息</button>
-            </div>
-        </div>
-
-        <!-- 主要内容 -->
-        <div class="content-grid">
-            <!-- 日志列表 -->
-            <div class="panel">
-                <div class="panel-header">
-                    <div class="panel-title">
-                        <div class="panel-title-icon">📝</div>
-                        实时日志流
-                    </div>
-                    <span id="log-count" style="color: var(--text-muted); font-size: 0.85rem;">加载中...</span>
-                </div>
-                <div class="log-list" id="log-list">
-                    <div class="loading">
-                        <div class="spinner"></div>
-                    </div>
+    <div class="main-layout">
+        <!-- 侧边栏 -->
+        <aside class="sidebar">
+            <div class="sidebar-section">
+                <div class="sidebar-title">服务器节点</div>
+                <div class="server-list" id="server-list">
+                    <div class="loading"><div class="spinner"></div></div>
                 </div>
             </div>
 
-            <!-- 服务器列表 -->
-            <div class="panel">
-                <div class="panel-header">
-                    <div class="panel-title">
-                        <div class="panel-title-icon">🖥️</div>
-                        服务器状态
+            <div class="sidebar-section">
+                <div class="sidebar-title">统计概览</div>
+                <div class="stats-mini" id="stats-mini">
+                    <div class="stat-mini">
+                        <div class="stat-mini-value" id="stat-total">-</div>
+                        <div class="stat-mini-label">总日志数</div>
                     </div>
-                </div>
-                <div id="server-list">
-                    <div class="loading">
-                        <div class="spinner"></div>
+                    <div class="stat-mini">
+                        <div class="stat-mini-value" id="stat-types">-</div>
+                        <div class="stat-mini-label">WAL类型</div>
                     </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- 底部图表 -->
-        <div class="bottom-grid">
-            <!-- 级别分布 -->
-            <div class="panel">
-                <div class="panel-header">
-                    <div class="panel-title">
-                        <div class="panel-title-icon">📈</div>
-                        日志级别分布
+                    <div class="stat-mini">
+                        <div class="stat-mini-value" id="stat-xids">-</div>
+                        <div class="stat-mini-label">事务数</div>
                     </div>
-                </div>
-                <div class="level-chart" id="level-chart">
-                    <div class="loading">
-                        <div class="spinner"></div>
+                    <div class="stat-mini">
+                        <div class="stat-mini-value" id="stat-pages">-</div>
+                        <div class="stat-mini-label">页面数</div>
                     </div>
                 </div>
             </div>
+        </aside>
 
-            <!-- 服务统计 -->
-            <div class="panel">
-                <div class="panel-header">
-                    <div class="panel-title">
-                        <div class="panel-title-icon">⚙️</div>
-                        热门服务
-                    </div>
-                </div>
-                <div class="level-chart" id="service-chart">
-                    <div class="loading">
-                        <div class="spinner"></div>
-                    </div>
-                </div>
+        <!-- 主内容 -->
+        <main class="main-content">
+            <!-- 视图切换 -->
+            <div class="view-tabs">
+                <button class="view-tab active" data-view="all">全量日志</button>
+                <button class="view-tab" data-view="by-xid">按 XID 分组</button>
+                <button class="view-tab" data-view="by-pageid">按 PageID 分组</button>
+                <button class="view-tab" data-view="by-plsn">按 PLSN 分组</button>
+                <button class="view-tab" data-view="by-type">按类型分组</button>
             </div>
 
-            <!-- 日志类型 -->
-            <div class="panel">
-                <div class="panel-header">
-                    <div class="panel-title">
-                        <div class="panel-title-icon">📁</div>
-                        日志类型
-                    </div>
+            <!-- 过滤器 -->
+            <div class="filters">
+                <div class="filter-group">
+                    <label class="filter-label">XID:</label>
+                    <input type="text" class="filter-input" id="filter-xid" placeholder="如: (412,12321)">
                 </div>
-                <div class="level-chart" id="type-chart">
-                    <div class="loading">
-                        <div class="spinner"></div>
-                    </div>
+                <div class="filter-group">
+                    <label class="filter-label">PageID:</label>
+                    <input type="text" class="filter-input" id="filter-pageid" placeholder="如: (1,5)">
                 </div>
+                <div class="filter-group">
+                    <label class="filter-label">PLSN:</label>
+                    <input type="text" class="filter-input" id="filter-plsn" placeholder="如: 123456">
+                </div>
+                <div class="filter-group">
+                    <label class="filter-label">类型:</label>
+                    <select class="filter-select" id="filter-type">
+                        <option value="">全部</option>
+                    </select>
+                </div>
+                <button class="btn btn-primary" onclick="applyFilters()">过滤</button>
+                <button class="btn btn-secondary" onclick="clearFilters()">清除</button>
             </div>
-        </div>
-    </main>
+
+            <!-- 内容区 -->
+            <div id="content-area">
+                <div class="loading"><div class="spinner"></div></div>
+            </div>
+
+            <!-- 分页 -->
+            <div class="pagination" id="pagination" style="display: none;"></div>
+        </main>
+    </div>
 
     <!-- 日志详情模态框 -->
     <div class="modal-overlay" id="log-modal">
         <div class="modal">
             <div class="modal-header">
-                <h3>日志详情</h3>
+                <h3 class="modal-title">WAL 日志详情</h3>
                 <button class="modal-close" onclick="closeModal()">&times;</button>
             </div>
-            <div class="modal-body" id="log-detail">
-            </div>
+            <div class="modal-body" id="log-detail"></div>
         </div>
     </div>
 
     <script>
-        // 配置
-        const API_BASE = window.location.origin;
-        let currentHours = 24;
-        let currentLevel = 'all';
-        let currentServerId = 'all';
-        let searchQuery = '';
+        // 状态
+        let currentServerId = null;
+        let currentView = 'all';
+        let currentPage = 1;
+        let pageSize = 50;
+        let totalLogs = 0;
+        let filters = { xid: '', pageid: '', plsn: '', type: '' };
+        let walTypes = [];
 
         // 初始化
         document.addEventListener('DOMContentLoaded', () => {
-            loadAllData();
+            loadServers();
             setupEventListeners();
-            // 每30秒自动刷新
-            setInterval(refreshData, 30000);
         });
 
         function setupEventListeners() {
-            // 时间选择器
-            document.querySelectorAll('.time-btn').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    document.querySelectorAll('.time-btn').forEach(b => b.classList.remove('active'));
-                    btn.classList.add('active');
-                    currentHours = parseInt(btn.dataset.hours);
-                    refreshData();
+            // 视图切换
+            document.querySelectorAll('.view-tab').forEach(tab => {
+                tab.addEventListener('click', () => {
+                    document.querySelectorAll('.view-tab').forEach(t => t.classList.remove('active'));
+                    tab.classList.add('active');
+                    currentView = tab.dataset.view;
+                    currentPage = 1;
+                    loadContent();
                 });
-            });
-
-            // 级别过滤器
-            document.querySelectorAll('.filter-btn').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-                    btn.classList.add('active');
-                    currentLevel = btn.dataset.level;
-                    loadLogs();
-                });
-            });
-
-            // 搜索框
-            let searchTimeout;
-            document.getElementById('search-input').addEventListener('input', (e) => {
-                clearTimeout(searchTimeout);
-                searchTimeout = setTimeout(() => {
-                    searchQuery = e.target.value;
-                    loadLogs();
-                }, 300);
-            });
-
-            // 服务器选择器
-            document.getElementById('server-selector').addEventListener('change', (e) => {
-                currentServerId = e.target.value;
-                loadLogs();
             });
 
             // 模态框关闭
-            document.getElementById('log-modal').addEventListener('click', (e) => {
-                if (e.target.classList.contains('modal-overlay')) {
-                    closeModal();
-                }
+            document.getElementById('log-modal').addEventListener('click', e => {
+                if (e.target.classList.contains('modal-overlay')) closeModal();
             });
         }
 
-        async function loadAllData() {
-            await Promise.all([
-                loadStats(),
-                loadLogs(),
-                loadServers()
-            ]);
-        }
-
-        async function refreshData() {
-            await loadAllData();
-        }
-
-        async function loadStats() {
+        async function loadServers() {
             try {
-                const res = await fetch(`${API_BASE}/api/stats?hours=${currentHours}`);
+                const res = await fetch('/api/servers');
                 const data = await res.json();
 
-                document.getElementById('total-logs').textContent = formatNumber(data.overview.total_logs);
-                document.getElementById('active-servers').textContent = data.overview.active_servers;
-                
-                const warnings = (data.by_level.warning || 0) + (data.by_level.warn || 0);
-                const errors = (data.by_level.error || 0) + (data.by_level.crit || 0) + 
-                              (data.by_level.alert || 0) + (data.by_level.emerg || 0);
-                
-                document.getElementById('warning-count').textContent = formatNumber(warnings);
-                document.getElementById('error-count').textContent = formatNumber(errors);
+                const container = document.getElementById('server-list');
+                const mobileSelect = document.getElementById('mobile-server-select');
 
-                document.getElementById('logs-change').innerHTML = `<span>📊</span> 最近 ${currentHours} 小时`;
+                if (data.servers.length === 0) {
+                    container.innerHTML = '<div class="empty-state"><p>暂无服务器</p></div>';
+                    return;
+                }
 
-                // 更新图表
-                renderLevelChart(data.by_level);
-                renderServiceChart(data.by_service);
-                renderTypeChart(data.by_type);
+                container.innerHTML = data.servers.map(s => `
+                    <div class="server-item ${currentServerId === s.id ? 'active' : ''}"
+                         data-id="${s.id}" onclick="selectServer('${s.id}')">
+                        <div class="server-name">${s.hostname}</div>
+                        <div class="server-meta">
+                            <span>${s.ip || '-'}</span>
+                            <span>${formatNumber(s.total_logs)} 条</span>
+                        </div>
+                    </div>
+                `).join('');
 
-            } catch (error) {
-                console.error('Failed to load stats:', error);
+                mobileSelect.innerHTML = '<option value="">选择服务器</option>' +
+                    data.servers.map(s => `<option value="${s.id}">${s.hostname}</option>`).join('');
+
+                // 默认选择第一个
+                if (!currentServerId && data.servers.length > 0) {
+                    selectServer(data.servers[0].id);
+                }
+            } catch (e) {
+                console.error('加载服务器失败:', e);
             }
         }
 
-        async function loadLogs() {
-            const container = document.getElementById('log-list');
-            container.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+        function selectServer(serverId) {
+            currentServerId = serverId;
+            currentPage = 1;
+
+            document.querySelectorAll('.server-item').forEach(item => {
+                item.classList.toggle('active', item.dataset.id === serverId);
+            });
+
+            loadStats();
+            loadContent();
+            loadWalTypes();
+        }
+
+        async function loadStats() {
+            if (!currentServerId) return;
 
             try {
-                let url = `${API_BASE}/api/logs?limit=100`;
-                if (currentLevel !== 'all') {
-                    url += `&level=${currentLevel}`;
-                }
-                if (currentServerId !== 'all') {
-                    url += `&server_id=${currentServerId}`;
-                }
-                if (searchQuery) {
-                    url += `&search=${encodeURIComponent(searchQuery)}`;
-                }
+                const res = await fetch(`/api/stats?server_id=${currentServerId}`);
+                const data = await res.json();
+
+                document.getElementById('stat-total').textContent = formatNumber(data.overview.total_logs);
+                document.getElementById('stat-types').textContent = data.overview.wal_types || 0;
+
+                // 计算唯一 XID 和 PageID 数量
+                const xidCount = Object.keys(data.by_xid || {}).length;
+                const pageCount = Object.keys(data.by_page_id || {}).length;
+
+                document.getElementById('stat-xids').textContent = formatNumber(xidCount);
+                document.getElementById('stat-pages').textContent = formatNumber(pageCount);
+            } catch (e) {
+                console.error('加载统计失败:', e);
+            }
+        }
+
+        async function loadWalTypes() {
+            if (!currentServerId) return;
+
+            try {
+                const res = await fetch(`/api/wal-types?server_id=${currentServerId}`);
+                const data = await res.json();
+
+                walTypes = data.types || [];
+                const select = document.getElementById('filter-type');
+                select.innerHTML = '<option value="">全部</option>' +
+                    walTypes.map(t => `<option value="${t}">${t}</option>`).join('');
+            } catch (e) {
+                console.error('加载WAL类型失败:', e);
+            }
+        }
+
+        async function loadContent() {
+            const container = document.getElementById('content-area');
+            container.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+
+            if (!currentServerId) {
+                container.innerHTML = '<div class="empty-state"><div class="empty-icon">📂</div><p>请选择一个服务器节点</p></div>';
+                return;
+            }
+
+            if (currentView === 'all') {
+                await loadAllLogs();
+            } else {
+                await loadGroupedLogs();
+            }
+        }
+
+        async function loadAllLogs() {
+            const container = document.getElementById('content-area');
+
+            try {
+                let url = `/api/logs?server_id=${currentServerId}&limit=${pageSize}&offset=${(currentPage - 1) * pageSize}`;
+
+                if (filters.xid) url += `&xid=${encodeURIComponent(filters.xid)}`;
+                if (filters.pageid) url += `&page_id=${encodeURIComponent(filters.pageid)}`;
+                if (filters.plsn) url += `&plsn=${encodeURIComponent(filters.plsn)}`;
+                if (filters.type) url += `&type=${encodeURIComponent(filters.type)}`;
 
                 const res = await fetch(url);
                 const data = await res.json();
 
-                document.getElementById('log-count').textContent = `共 ${data.total} 条`;
+                totalLogs = data.total;
 
                 if (data.logs.length === 0) {
-                    container.innerHTML = `
-                        <div class="empty-state">
-                            <div class="empty-state-icon">📭</div>
-                            <p>暂无日志数据</p>
-                            <p style="font-size: 0.85rem; margin-top: 0.5rem;">
-                                使用上传脚本发送日志到此平台
-                            </p>
-                        </div>
-                    `;
+                    container.innerHTML = '<div class="empty-state"><div class="empty-icon">📭</div><p>暂无日志数据</p></div>';
+                    document.getElementById('pagination').style.display = 'none';
                     return;
                 }
 
-                container.innerHTML = data.logs.map(log => `
-                    <div class="log-entry" onclick="showLogDetail(${JSON.stringify(log).replace(/"/g, '&quot;')})">
-                        <span class="log-level ${log.level}">${log.level}</span>
-                        <div class="log-content">
-                            <div class="log-message">${escapeHtml(log.message)}</div>
-                            <div class="log-meta">
-                                <span>🖥️ ${log.hostname || log.server_id}</span>
-                                <span>⚙️ ${log.service || '-'}</span>
-                                <span>📁 ${log.log_type}</span>
-                                <span>🕐 ${formatTime(log.received_at)}</span>
-                            </div>
-                        </div>
-                    </div>
-                `).join('');
-
-            } catch (error) {
-                console.error('Failed to load logs:', error);
                 container.innerHTML = `
-                    <div class="empty-state">
-                        <div class="empty-state-icon">⚠️</div>
-                        <p>加载失败</p>
+                    <div class="wal-table-container">
+                        <table class="wal-table">
+                            <thead>
+                                <tr>
+                                    <th style="width: 60px;">#</th>
+                                    <th style="width: 100px;">PLSN</th>
+                                    <th style="width: 140px;">XID</th>
+                                    <th style="width: 140px;">PageID</th>
+                                    <th style="width: 180px;">类型</th>
+                                    <th>时间</th>
+                                    <th style="width: 80px;">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${data.logs.map((log, i) => `
+                                    <tr>
+                                        <td>${(currentPage - 1) * pageSize + i + 1}</td>
+                                        <td class="clickable" onclick="filterByField('plsn', '${log.plsn || ''}')">${log.plsn || '-'}</td>
+                                        <td class="clickable" onclick="filterByField('xid', '${log.xid || ''}')">${log.xid || '-'}</td>
+                                        <td class="clickable" onclick="filterByField('pageid', '${log.page_id || ''}')">${log.page_id || '-'}</td>
+                                        <td><span class="wal-type ${getTypeClass(log.type)}">${log.type || '-'}</span></td>
+                                        <td>${formatTime(log.received_at)}</td>
+                                        <td><button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;" onclick='showLogDetail(${JSON.stringify(log)})'>详情</button></td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
                     </div>
                 `;
+
+                renderPagination();
+            } catch (e) {
+                console.error('加载日志失败:', e);
+                container.innerHTML = '<div class="empty-state"><div class="empty-icon">⚠️</div><p>加载失败</p></div>';
             }
         }
 
-        async function loadServers() {
-            const container = document.getElementById('server-list');
-            const serverSelector = document.getElementById('server-selector');
+        async function loadGroupedLogs() {
+            const container = document.getElementById('content-area');
 
             try {
-                const res = await fetch(`${API_BASE}/api/servers`);
+                const groupBy = currentView.replace('by-', '');
+                let url = `/api/logs/grouped?server_id=${currentServerId}&group_by=${groupBy}`;
+
+                if (filters.type) url += `&type=${encodeURIComponent(filters.type)}`;
+
+                const res = await fetch(url);
                 const data = await res.json();
 
-                if (data.servers.length === 0) {
-                    container.innerHTML = `
-                        <div class="empty-state">
-                            <div class="empty-state-icon">🖥️</div>
-                            <p>暂无注册服务器</p>
-                        </div>
-                    `;
-                    serverSelector.innerHTML = '<option value="all">所有服务器</option>';
+                if (!data.groups || data.groups.length === 0) {
+                    container.innerHTML = '<div class="empty-state"><div class="empty-icon">📭</div><p>暂无分组数据</p></div>';
+                    document.getElementById('pagination').style.display = 'none';
                     return;
                 }
 
-                // 填充服务器选择器
-                const currentSelection = currentServerId;
-                serverSelector.innerHTML = '<option value="all">所有服务器</option>' +
-                    data.servers.map(server => `
-                        <option value="${server.id}">${server.hostname} (${server.ip_address || 'N/A'})</option>
-                    `).join('');
-                serverSelector.value = currentSelection;
-
-                container.innerHTML = data.servers.map(server => `
-                    <div class="server-item">
-                        <div class="server-info">
-                            <div class="server-avatar">🖥️</div>
-                            <div>
-                                <div class="server-name">${server.hostname}</div>
-                                <div class="server-id">${server.id}</div>
+                container.innerHTML = `
+                    <div class="group-view">
+                        ${data.groups.map(group => `
+                            <div class="group-card" data-key="${group.key}">
+                                <div class="group-header" onclick="toggleGroup(this)">
+                                    <span class="group-title">${getGroupLabel(groupBy)}: ${group.key || '(空)'}</span>
+                                    <span class="group-count">${group.count} 条</span>
+                                </div>
+                                <div class="group-body">
+                                    ${group.items.map(item => `
+                                        <div class="group-item" onclick='showLogDetail(${JSON.stringify(item)})'>
+                                            <span style="color: var(--text-muted);">PLSN:</span> ${item.plsn || '-'}
+                                            <span style="color: var(--text-muted); margin-left: 1rem;">类型:</span>
+                                            <span class="wal-type ${getTypeClass(item.type)}">${item.type || '-'}</span>
+                                            <span style="color: var(--text-muted); margin-left: 1rem;">时间:</span> ${formatTime(item.received_at)}
+                                        </div>
+                                    `).join('')}
+                                    ${group.count > group.items.length ? `
+                                        <div class="group-item" style="text-align: center; color: var(--accent-cyan); cursor: pointer;"
+                                             onclick="filterByField('${groupBy === 'xid' ? 'xid' : groupBy === 'pageid' ? 'pageid' : 'plsn'}', '${group.key}')">
+                                            查看全部 ${group.count} 条 →
+                                        </div>
+                                    ` : ''}
+                                </div>
                             </div>
-                        </div>
-                        <div class="server-stats">
-                            <div class="server-logs">${formatNumber(server.total_logs)}</div>
-                            <div class="server-status">${getServerStatus(server.last_seen)}</div>
-                        </div>
+                        `).join('')}
                     </div>
-                `).join('');
+                `;
 
-            } catch (error) {
-                console.error('Failed to load servers:', error);
+                document.getElementById('pagination').style.display = 'none';
+            } catch (e) {
+                console.error('加载分组失败:', e);
+                container.innerHTML = '<div class="empty-state"><div class="empty-icon">⚠️</div><p>加载失败</p></div>';
             }
         }
 
-        function renderLevelChart(levels) {
-            const container = document.getElementById('level-chart');
-            const total = Object.values(levels).reduce((a, b) => a + b, 0) || 1;
-
-            const levelConfig = {
-                error: { label: 'ERROR', class: 'error' },
-                warning: { label: 'WARNING', class: 'warning' },
-                info: { label: 'INFO', class: 'info' },
-                debug: { label: 'DEBUG', class: 'debug' }
-            };
-
-            const consolidatedLevels = {
-                error: (levels.error || 0) + (levels.crit || 0) + (levels.alert || 0) + (levels.emerg || 0),
-                warning: (levels.warning || 0) + (levels.warn || 0),
-                info: (levels.info || 0) + (levels.notice || 0),
-                debug: levels.debug || 0
-            };
-
-            container.innerHTML = Object.entries(levelConfig).map(([key, config]) => {
-                const count = consolidatedLevels[key] || 0;
-                const percentage = (count / total * 100).toFixed(1);
-                return `
-                    <div class="level-bar">
-                        <span class="level-label">${config.label}</span>
-                        <div class="level-bar-bg">
-                            <div class="level-bar-fill ${config.class}" style="width: ${percentage}%"></div>
-                        </div>
-                        <span class="level-count">${formatNumber(count)}</span>
-                    </div>
-                `;
-            }).join('');
+        function toggleGroup(header) {
+            header.parentElement.classList.toggle('expanded');
         }
 
-        function renderServiceChart(services) {
-            const container = document.getElementById('service-chart');
-            const entries = Object.entries(services).slice(0, 5);
-            const max = entries.length > 0 ? entries[0][1] : 1;
+        function getGroupLabel(groupBy) {
+            const labels = { xid: 'XID', pageid: 'PageID', plsn: 'PLSN', type: '类型' };
+            return labels[groupBy] || groupBy;
+        }
 
-            if (entries.length === 0) {
-                container.innerHTML = `
-                    <div class="empty-state">
-                        <p style="color: var(--text-muted);">暂无服务数据</p>
-                    </div>
-                `;
+        function getTypeClass(type) {
+            if (!type) return 'other';
+            const t = type.toUpperCase();
+            if (t.includes('UPDATE')) return 'update';
+            if (t.includes('INSERT')) return 'insert';
+            if (t.includes('DELETE') || t.includes('TRUNCATE')) return 'delete';
+            return 'other';
+        }
+
+        function filterByField(field, value) {
+            if (!value || value === '-') return;
+
+            if (field === 'xid') filters.xid = value;
+            else if (field === 'pageid') filters.pageid = value;
+            else if (field === 'plsn') filters.plsn = value;
+
+            document.getElementById('filter-xid').value = filters.xid;
+            document.getElementById('filter-pageid').value = filters.pageid;
+            document.getElementById('filter-plsn').value = filters.plsn;
+
+            // 切换到全量视图
+            currentView = 'all';
+            document.querySelectorAll('.view-tab').forEach(t => t.classList.remove('active'));
+            document.querySelector('.view-tab[data-view="all"]').classList.add('active');
+
+            currentPage = 1;
+            loadContent();
+        }
+
+        function applyFilters() {
+            filters.xid = document.getElementById('filter-xid').value.trim();
+            filters.pageid = document.getElementById('filter-pageid').value.trim();
+            filters.plsn = document.getElementById('filter-plsn').value.trim();
+            filters.type = document.getElementById('filter-type').value;
+
+            currentPage = 1;
+            loadContent();
+        }
+
+        function clearFilters() {
+            filters = { xid: '', pageid: '', plsn: '', type: '' };
+            document.getElementById('filter-xid').value = '';
+            document.getElementById('filter-pageid').value = '';
+            document.getElementById('filter-plsn').value = '';
+            document.getElementById('filter-type').value = '';
+
+            currentPage = 1;
+            loadContent();
+        }
+
+        function renderPagination() {
+            const totalPages = Math.ceil(totalLogs / pageSize);
+            const pagination = document.getElementById('pagination');
+
+            if (totalPages <= 1) {
+                pagination.style.display = 'none';
                 return;
             }
 
-            container.innerHTML = entries.map(([service, count]) => {
-                const percentage = (count / max * 100).toFixed(1);
-                return `
-                    <div class="level-bar">
-                        <span class="level-label" style="width: 120px; font-size: 0.75rem;">${service}</span>
-                        <div class="level-bar-bg">
-                            <div class="level-bar-fill info" style="width: ${percentage}%"></div>
-                        </div>
-                        <span class="level-count">${formatNumber(count)}</span>
-                    </div>
-                `;
-            }).join('');
-        }
+            pagination.style.display = 'flex';
 
-        function renderTypeChart(types) {
-            const container = document.getElementById('type-chart');
-            const entries = Object.entries(types);
-            const max = entries.length > 0 ? Math.max(...entries.map(e => e[1])) : 1;
+            let html = `
+                <button class="page-btn" onclick="goToPage(1)" ${currentPage === 1 ? 'disabled' : ''}>首页</button>
+                <button class="page-btn" onclick="goToPage(${currentPage - 1})" ${currentPage === 1 ? 'disabled' : ''}>上一页</button>
+            `;
 
-            if (entries.length === 0) {
-                container.innerHTML = `
-                    <div class="empty-state">
-                        <p style="color: var(--text-muted);">暂无类型数据</p>
-                    </div>
-                `;
-                return;
+            const start = Math.max(1, currentPage - 2);
+            const end = Math.min(totalPages, currentPage + 2);
+
+            for (let i = start; i <= end; i++) {
+                html += `<button class="page-btn ${i === currentPage ? 'active' : ''}" onclick="goToPage(${i})">${i}</button>`;
             }
 
-            const colors = ['info', 'warning', 'error', 'debug'];
-            container.innerHTML = entries.map(([type, count], i) => {
-                const percentage = (count / max * 100).toFixed(1);
-                return `
-                    <div class="level-bar">
-                        <span class="level-label">${type}</span>
-                        <div class="level-bar-bg">
-                            <div class="level-bar-fill ${colors[i % colors.length]}" style="width: ${percentage}%"></div>
-                        </div>
-                        <span class="level-count">${formatNumber(count)}</span>
-                    </div>
-                `;
-            }).join('');
+            html += `
+                <button class="page-btn" onclick="goToPage(${currentPage + 1})" ${currentPage === totalPages ? 'disabled' : ''}>下一页</button>
+                <button class="page-btn" onclick="goToPage(${totalPages})" ${currentPage === totalPages ? 'disabled' : ''}>末页</button>
+                <span class="page-info">共 ${totalLogs} 条，${totalPages} 页</span>
+            `;
+
+            pagination.innerHTML = html;
+        }
+
+        function goToPage(page) {
+            currentPage = page;
+            loadContent();
+            window.scrollTo(0, 0);
         }
 
         function showLogDetail(log) {
@@ -1214,26 +975,34 @@
             const detail = document.getElementById('log-detail');
 
             detail.innerHTML = `
-                <div style="margin-bottom: 1rem;">
-                    <span class="log-level ${log.level}" style="display: inline-block; margin-bottom: 1rem;">${log.level}</span>
+                <div class="log-detail-row">
+                    <div class="log-detail-label">PLSN</div>
+                    <div class="log-detail-value">${log.plsn || '-'}</div>
                 </div>
-                <div style="display: grid; gap: 0.75rem; margin-bottom: 1.5rem;">
-                    <div><strong style="color: var(--text-secondary);">服务器:</strong> ${log.hostname || log.server_id}</div>
-                    <div><strong style="color: var(--text-secondary);">服务:</strong> ${log.service || '-'}</div>
-                    <div><strong style="color: var(--text-secondary);">类型:</strong> ${log.log_type}</div>
-                    <div><strong style="color: var(--text-secondary);">时间:</strong> ${log.received_at}</div>
-                    ${log.timestamp ? `<div><strong style="color: var(--text-secondary);">日志时间:</strong> ${log.timestamp}</div>` : ''}
+                <div class="log-detail-row">
+                    <div class="log-detail-label">XID</div>
+                    <div class="log-detail-value">${log.xid || '-'}</div>
                 </div>
-                <div style="margin-bottom: 1rem;">
-                    <strong style="color: var(--text-secondary);">消息内容:</strong>
+                <div class="log-detail-row">
+                    <div class="log-detail-label">PageID</div>
+                    <div class="log-detail-value">${log.page_id || '-'}</div>
                 </div>
-                <pre>${escapeHtml(log.message)}</pre>
-                ${Object.keys(log.metadata || {}).length > 0 ? `
-                    <div style="margin-top: 1rem;">
-                        <strong style="color: var(--text-secondary);">元数据:</strong>
-                        <pre>${JSON.stringify(log.metadata, null, 2)}</pre>
-                    </div>
-                ` : ''}
+                <div class="log-detail-row">
+                    <div class="log-detail-label">WAL 类型</div>
+                    <div class="log-detail-value"><span class="wal-type ${getTypeClass(log.type)}">${log.type || '-'}</span></div>
+                </div>
+                <div class="log-detail-row">
+                    <div class="log-detail-label">服务器</div>
+                    <div class="log-detail-value">${log.hostname || log.server_id}</div>
+                </div>
+                <div class="log-detail-row">
+                    <div class="log-detail-label">接收时间</div>
+                    <div class="log-detail-value">${log.received_at}</div>
+                </div>
+                <div style="margin-top: 1.5rem;">
+                    <div class="log-detail-label" style="margin-bottom: 0.5rem;">原始日志</div>
+                    <div class="raw-log">${escapeHtml(log.message || '')}</div>
+                </div>
             `;
 
             modal.classList.add('active');
@@ -1243,30 +1012,25 @@
             document.getElementById('log-modal').classList.remove('active');
         }
 
+        function refreshData() {
+            loadServers();
+            if (currentServerId) {
+                loadStats();
+                loadContent();
+            }
+        }
+
         // 工具函数
         function formatNumber(num) {
             if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
             if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
-            return num.toString();
+            return (num || 0).toString();
         }
 
-        function formatTime(timestamp) {
-            if (!timestamp) return '-';
-            const date = new Date(timestamp);
-            return date.toLocaleString('zh-CN', {
-                month: '2-digit',
-                day: '2-digit',
-                hour: '2-digit',
-                minute: '2-digit'
-            });
-        }
-
-        function getServerStatus(lastSeen) {
-            if (!lastSeen) return '未知';
-            const diff = Date.now() - new Date(lastSeen).getTime();
-            if (diff < 300000) return '● 在线';
-            if (diff < 3600000) return '○ 5分钟前';
-            return '○ 离线';
+        function formatTime(ts) {
+            if (!ts) return '-';
+            const d = new Date(ts);
+            return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
         }
 
         function escapeHtml(text) {
