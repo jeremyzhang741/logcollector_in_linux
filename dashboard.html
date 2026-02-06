@@ -572,9 +572,9 @@
             <!-- 视图切换 -->
             <div class="view-tabs">
                 <button class="view-tab active" data-view="all">全量日志</button>
+                <button class="view-tab" data-view="by-stream">按日志流分组</button>
                 <button class="view-tab" data-view="by-xid">按 XID 分组</button>
                 <button class="view-tab" data-view="by-pageid">按 PageID 分组</button>
-                <button class="view-tab" data-view="by-plsn">按 PLSN 分组</button>
                 <button class="view-tab" data-view="by-type">按类型分组</button>
             </div>
 
@@ -630,7 +630,7 @@
         let currentPage = 1;
         let pageSize = 50;
         let totalLogs = 0;
-        let filters = { xid: '', pageid: '', plsn: '', type: '' };
+        let filters = { xid: '', pageid: '', plsn: '', type: '', stream: '' };
         let walTypes = [];
 
         // 初始化
@@ -673,16 +673,16 @@
                 container.innerHTML = data.servers.map(s => `
                     <div class="server-item ${currentServerId === s.id ? 'active' : ''}"
                          data-id="${s.id}" onclick="selectServer('${s.id}')">
-                        <div class="server-name">${s.hostname}</div>
+                        <div class="server-name">${s.ip || '-'}</div>
                         <div class="server-meta">
-                            <span>${s.ip || '-'}</span>
+                            <span>${s.hostname}</span>
                             <span>${formatNumber(s.total_logs)} 条</span>
                         </div>
                     </div>
                 `).join('');
 
                 mobileSelect.innerHTML = '<option value="">选择服务器</option>' +
-                    data.servers.map(s => `<option value="${s.id}">${s.hostname}</option>`).join('');
+                    data.servers.map(s => `<option value="${s.id}">${s.ip || s.hostname}</option>`).join('');
 
                 // 默认选择第一个
                 if (!currentServerId && data.servers.length > 0) {
@@ -769,6 +769,7 @@
                 if (filters.pageid) url += `&page_id=${encodeURIComponent(filters.pageid)}`;
                 if (filters.plsn) url += `&plsn=${encodeURIComponent(filters.plsn)}`;
                 if (filters.type) url += `&type=${encodeURIComponent(filters.type)}`;
+                if (filters.stream) url += `&stream=${encodeURIComponent(filters.stream)}`;
 
                 const res = await fetch(url);
                 const data = await res.json();
@@ -848,15 +849,16 @@
                                 <div class="group-body">
                                     ${group.items.map(item => `
                                         <div class="group-item" onclick='showLogDetail(${JSON.stringify(item)})'>
-                                            <span style="color: var(--text-muted);">PLSN:</span> ${item.plsn || '-'}
+                                            ${groupBy === 'pageid' && item.page_prev_glsn ? `<span style="color: var(--text-muted);">Prev GLSN:</span> ${item.page_prev_glsn} <span style="color: var(--text-muted); margin-left: 0.5rem;">|</span> ` : ''}
+                                            <span style="color: var(--text-muted); margin-left: ${groupBy === 'pageid' ? '0.5rem' : '0'};">PLSN:</span> ${item.plsn || '-'}
+                                            <span style="color: var(--text-muted); margin-left: 1rem;">XID:</span> ${item.xid || '-'}
                                             <span style="color: var(--text-muted); margin-left: 1rem;">类型:</span>
                                             <span class="wal-type ${getTypeClass(item.type)}">${item.type || '-'}</span>
-                                            <span style="color: var(--text-muted); margin-left: 1rem;">时间:</span> ${formatTime(item.received_at)}
                                         </div>
                                     `).join('')}
                                     ${group.count > group.items.length ? `
                                         <div class="group-item" style="text-align: center; color: var(--accent-cyan); cursor: pointer;"
-                                             onclick="filterByField('${groupBy === 'xid' ? 'xid' : groupBy === 'pageid' ? 'pageid' : 'plsn'}', '${group.key}')">
+                                             onclick="viewAllInGroup('${groupBy}', '${group.key}')">
                                             查看全部 ${group.count} 条 →
                                         </div>
                                     ` : ''}
@@ -878,7 +880,7 @@
         }
 
         function getGroupLabel(groupBy) {
-            const labels = { xid: 'XID', pageid: 'PageID', plsn: 'PLSN', type: '类型' };
+            const labels = { xid: 'XID', pageid: 'PageID', plsn: 'PLSN', type: '类型', stream: '日志流' };
             return labels[groupBy] || groupBy;
         }
 
@@ -911,6 +913,23 @@
             loadContent();
         }
 
+        function viewAllInGroup(groupBy, key) {
+            // 根据分组类型设置对应的过滤器
+            clearFilters();
+            if (groupBy === 'xid') filters.xid = key;
+            else if (groupBy === 'pageid') filters.pageid = key;
+            else if (groupBy === 'stream') filters.stream = key;
+
+            document.getElementById('filter-xid').value = filters.xid || '';
+            document.getElementById('filter-pageid').value = filters.pageid || '';
+
+            currentView = 'all';
+            document.querySelectorAll('.view-tab').forEach(t => t.classList.remove('active'));
+            document.querySelector('.view-tab[data-view="all"]').classList.add('active');
+            currentPage = 1;
+            loadContent();
+        }
+
         function applyFilters() {
             filters.xid = document.getElementById('filter-xid').value.trim();
             filters.pageid = document.getElementById('filter-pageid').value.trim();
@@ -922,7 +941,7 @@
         }
 
         function clearFilters() {
-            filters = { xid: '', pageid: '', plsn: '', type: '' };
+            filters = { xid: '', pageid: '', plsn: '', type: '', stream: '' };
             document.getElementById('filter-xid').value = '';
             document.getElementById('filter-pageid').value = '';
             document.getElementById('filter-plsn').value = '';

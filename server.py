@@ -29,10 +29,12 @@ db_pool = None
 
 # WAL 日志解析正则
 WAL_PATTERN = re.compile(
+    r'dump_stream_(?P<stream>[\d_]+):.*?'
     r'plsn:(?P<plsn>\d+);.*?'
     r'xid:\s*\((?P<xid_h>\d+),\s*(?P<xid_l>\d+)\);.*?'
     r'type:(?P<type>\w+);.*?'
-    r'pageId=\((?P<pg1>\d+),(?P<pg2>\d+)\)',
+    r'pageId=\((?P<pg1>\d+),\s*(?P<pg2>\d+)\);.*?'
+    r'page prev glsn:(?P<prev_glsn>\d+)',
     re.IGNORECASE
 )
 
@@ -63,9 +65,19 @@ def init_db():
                 hostname VARCHAR(255),
                 log_type VARCHAR(50) DEFAULT 'wal',
                 received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                stream VARCHAR(32),
                 plsn TEXT, xid TEXT, type VARCHAR(128), page_id TEXT,
+                page_prev_glsn BIGINT,
                 message TEXT
             )
+        ''')
+        # 添加新列（如果不存在）
+        cur.execute('''
+            DO $$ BEGIN
+                ALTER TABLE log_entries ADD COLUMN IF NOT EXISTS stream VARCHAR(32);
+                ALTER TABLE log_entries ADD COLUMN IF NOT EXISTS page_prev_glsn BIGINT;
+            EXCEPTION WHEN duplicate_column THEN NULL;
+            END $$;
         ''')
         cur.execute('''
             CREATE TABLE IF NOT EXISTS servers (
@@ -78,7 +90,7 @@ def init_db():
                 total_logs BIGINT DEFAULT 0
             )
         ''')
-        for idx in ['server_id', 'plsn', 'xid', 'type', 'page_id', 'received_at']:
+        for idx in ['server_id', 'plsn', 'xid', 'type', 'page_id', 'received_at', 'stream', 'page_prev_glsn']:
             cur.execute(f'CREATE INDEX IF NOT EXISTS idx_{idx} ON log_entries({idx})')
         cur.close()
     print("✅ 数据库初始化完成")
@@ -89,13 +101,15 @@ def parse_wal(line):
     m = WAL_PATTERN.search(line)
     if m:
         return {
+            'stream': m.group('stream'),
             'plsn': m.group('plsn'),
             'xid': f"({m.group('xid_h')},{m.group('xid_l')})",
             'type': m.group('type'),
             'page_id': f"({m.group('pg1')},{m.group('pg2')})",
+            'page_prev_glsn': int(m.group('prev_glsn')),
             'message': line
         }
-    return {'plsn': None, 'xid': None, 'type': None, 'page_id': None, 'message': line}
+    return {'stream': None, 'plsn': None, 'xid': None, 'type': None, 'page_id': None, 'page_prev_glsn': None, 'message': line}
 
 
 # ==================== HTTP 处理器 ====================
@@ -189,12 +203,12 @@ class Handler(BaseHTTPRequestHandler):
             if not line.strip():
                 continue
             p = parse_wal(line)
-            rows.append((server_id, hostname, 'wal', p['plsn'], p['xid'], p['type'], p['page_id'], p['message']))
+            rows.append((server_id, hostname, 'wal', p['stream'], p['plsn'], p['xid'], p['type'], p['page_id'], p['page_prev_glsn'], p['message']))
 
         with get_db() as conn:
             cur = conn.cursor()
             execute_values(cur, '''
-                INSERT INTO log_entries (server_id, hostname, log_type, plsn, xid, type, page_id, message)
+                INSERT INTO log_entries (server_id, hostname, log_type, stream, plsn, xid, type, page_id, page_prev_glsn, message)
                 VALUES %s
             ''', rows, page_size=500)
             cur.execute('''
@@ -238,6 +252,7 @@ class Handler(BaseHTTPRequestHandler):
         page_id = q.get('page_id', [None])[0]
         plsn = q.get('plsn', [None])[0]
         wal_type = q.get('type', [None])[0]
+        stream = q.get('stream', [None])[0]
         limit = min(int(q.get('limit', ['100'])[0]), 1000)
         offset = int(q.get('offset', ['0'])[0])
 
@@ -247,6 +262,7 @@ class Handler(BaseHTTPRequestHandler):
         if page_id: conds.append('page_id = %s'); vals.append(page_id)
         if plsn: conds.append('plsn = %s'); vals.append(plsn)
         if wal_type: conds.append('type = %s'); vals.append(wal_type)
+        if stream: conds.append('stream = %s'); vals.append(stream)
 
         where = ' AND '.join(conds)
 
@@ -266,7 +282,7 @@ class Handler(BaseHTTPRequestHandler):
         group_by = q.get('group_by', ['xid'])[0]
         wal_type = q.get('type', [None])[0]
 
-        field_map = {'xid': 'xid', 'pageid': 'page_id', 'plsn': 'plsn', 'type': 'type'}
+        field_map = {'xid': 'xid', 'pageid': 'page_id', 'plsn': 'plsn', 'type': 'type', 'stream': 'stream'}
         field = field_map.get(group_by, 'xid')
 
         conds, vals = [f'{field} IS NOT NULL'], []
@@ -274,12 +290,20 @@ class Handler(BaseHTTPRequestHandler):
         if wal_type: conds.append('type = %s'); vals.append(wal_type)
         where = ' AND '.join(conds)
 
+        # 按分组类型设置排序规则
+        if group_by == 'pageid':
+            order_by = "page_prev_glsn ASC NULLS LAST, CAST(plsn AS BIGINT) ASC"
+        elif group_by in ('stream', 'xid'):
+            order_by = "CAST(plsn AS BIGINT) ASC"
+        else:
+            order_by = "received_at DESC"
+
         with get_db() as conn:
             cur = conn.cursor(cursor_factory=RealDictCursor)
             cur.execute(f"SELECT {field} as key, COUNT(*) as count FROM log_entries WHERE {where} GROUP BY {field} ORDER BY count DESC LIMIT 50", vals)
             groups = []
             for row in cur.fetchall():
-                cur.execute(f"SELECT * FROM log_entries WHERE {where} AND {field} = %s ORDER BY received_at DESC LIMIT 5",
+                cur.execute(f"SELECT * FROM log_entries WHERE {where} AND {field} = %s ORDER BY {order_by} LIMIT 10",
                             vals + [row['key']])
                 groups.append({'key': row['key'], 'count': row['count'], 'items': cur.fetchall()})
             cur.close()
