@@ -141,6 +141,7 @@ class Handler(BaseHTTPRequestHandler):
             '/api/stats': lambda: self._stats(q),
             '/api/logs': lambda: self._logs(q),
             '/api/logs/grouped': lambda: self._logs_grouped(q),
+            '/api/logs/group-detail': lambda: self._logs_in_group(q),
             '/api/wal-types': lambda: self._wal_types(q),
             '/api/servers': self._servers,
         }
@@ -281,6 +282,8 @@ class Handler(BaseHTTPRequestHandler):
         server_id = q.get('server_id', [None])[0]
         group_by = q.get('group_by', ['xid'])[0]
         wal_type = q.get('type', [None])[0]
+        limit = min(int(q.get('limit', ['20'])[0]), 200)
+        offset = int(q.get('offset', ['0'])[0])
 
         field_map = {'xid': 'xid', 'pageid': 'page_id', 'plsn': 'plsn', 'type': 'type', 'stream': 'stream'}
         field = field_map.get(group_by, 'xid')
@@ -290,7 +293,34 @@ class Handler(BaseHTTPRequestHandler):
         if wal_type: conds.append('type = %s'); vals.append(wal_type)
         where = ' AND '.join(conds)
 
-        # 按分组类型设置排序规则
+        with get_db() as conn:
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute(f"SELECT COUNT(DISTINCT {field}) as c FROM log_entries WHERE {where}", vals)
+            total_groups = cur.fetchone()['c']
+            cur.execute(f"SELECT {field} as key, COUNT(*) as count FROM log_entries WHERE {where} GROUP BY {field} ORDER BY count DESC LIMIT %s OFFSET %s",
+                        vals + [limit, offset])
+            groups = [{'key': row['key'], 'count': row['count']} for row in cur.fetchall()]
+            cur.close()
+
+        self._send({'groups': groups, 'group_by': group_by, 'total_groups': total_groups, 'limit': limit, 'offset': offset})
+
+    def _logs_in_group(self, q):
+        """获取某个分组内的全部记录（带分页）"""
+        server_id = q.get('server_id', [None])[0]
+        group_by = q.get('group_by', ['xid'])[0]
+        group_key = q.get('key', [None])[0]
+        wal_type = q.get('type', [None])[0]
+        limit = min(int(q.get('limit', ['50'])[0]), 500)
+        offset = int(q.get('offset', ['0'])[0])
+
+        field_map = {'xid': 'xid', 'pageid': 'page_id', 'plsn': 'plsn', 'type': 'type', 'stream': 'stream'}
+        field = field_map.get(group_by, 'xid')
+
+        conds, vals = [f'{field} = %s'], [group_key]
+        if server_id: conds.append('server_id = %s'); vals.append(server_id)
+        if wal_type: conds.append('type = %s'); vals.append(wal_type)
+        where = ' AND '.join(conds)
+
         if group_by == 'pageid':
             order_by = "page_prev_glsn ASC NULLS LAST, CAST(plsn AS BIGINT) ASC"
         elif group_by in ('stream', 'xid'):
@@ -300,15 +330,14 @@ class Handler(BaseHTTPRequestHandler):
 
         with get_db() as conn:
             cur = conn.cursor(cursor_factory=RealDictCursor)
-            cur.execute(f"SELECT {field} as key, COUNT(*) as count FROM log_entries WHERE {where} GROUP BY {field} ORDER BY count DESC LIMIT 50", vals)
-            groups = []
-            for row in cur.fetchall():
-                cur.execute(f"SELECT * FROM log_entries WHERE {where} AND {field} = %s ORDER BY {order_by} LIMIT 10",
-                            vals + [row['key']])
-                groups.append({'key': row['key'], 'count': row['count'], 'items': cur.fetchall()})
+            cur.execute(f"SELECT * FROM log_entries WHERE {where} ORDER BY {order_by} LIMIT %s OFFSET %s",
+                        vals + [limit, offset])
+            items = cur.fetchall()
+            cur.execute(f"SELECT COUNT(*) as c FROM log_entries WHERE {where}", vals)
+            total = cur.fetchone()['c']
             cur.close()
 
-        self._send({'groups': groups, 'group_by': group_by})
+        self._send({'items': items, 'total': total, 'limit': limit, 'offset': offset})
 
     def _wal_types(self, q):
         server_id = q.get('server_id', [None])[0]

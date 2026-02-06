@@ -418,6 +418,72 @@
         .page-btn.active { background: var(--accent-cyan); color: var(--bg-primary); }
         .page-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+        /* 页面大小选择器 */
+        .page-size-bar {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+            font-size: 0.85rem;
+        }
+
+        .page-size-bar label {
+            color: var(--text-secondary);
+        }
+
+        .page-size-select {
+            padding: 0.35rem 0.6rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.85rem;
+        }
+
+        .page-size-select:focus {
+            outline: none;
+            border-color: var(--accent-cyan);
+        }
+
+        .page-jump {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            margin-left: 0.5rem;
+        }
+
+        .page-jump-input {
+            width: 52px;
+            padding: 0.35rem 0.4rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            text-align: center;
+        }
+
+        .page-jump-input:focus {
+            outline: none;
+            border-color: var(--accent-cyan);
+        }
+
+        .page-jump-btn {
+            padding: 0.35rem 0.6rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.8rem;
+            cursor: pointer;
+        }
+
+        .page-jump-btn:hover {
+            border-color: var(--accent-cyan);
+        }
+
         .page-info {
             color: var(--text-muted);
             font-size: 0.85rem;
@@ -475,6 +541,15 @@
             max-width: 800px;
             max-height: 80vh;
             overflow: hidden;
+            transition: all 0.3s ease;
+        }
+
+        .modal.maximized {
+            width: 100%;
+            max-width: 100%;
+            max-height: 100vh;
+            height: 100vh;
+            border-radius: 0;
         }
 
         .modal-header {
@@ -487,18 +562,52 @@
 
         .modal-title { font-size: 1.1rem; font-weight: 600; }
 
+        .modal-header-btns {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .modal-btn {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+            cursor: pointer;
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            line-height: 1;
+        }
+
+        .modal-btn:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
         .modal-close {
             background: none;
             border: none;
             color: var(--text-secondary);
             font-size: 1.5rem;
             cursor: pointer;
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            line-height: 1;
+        }
+
+        .modal-close:hover {
+            background: var(--accent-red);
+            color: #fff;
         }
 
         .modal-body {
             padding: 1.5rem;
             overflow-y: auto;
             max-height: 60vh;
+        }
+
+        .modal.maximized .modal-body {
+            max-height: calc(100vh - 70px);
         }
 
         .raw-log {
@@ -511,6 +620,24 @@
             white-space: pre-wrap;
             word-break: break-all;
             margin-top: 1rem;
+        }
+
+        /* 分组放大按钮 */
+        .group-expand-btn {
+            background: none;
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            cursor: pointer;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            margin-left: 0.5rem;
+            line-height: 1;
+        }
+
+        .group-expand-btn:hover {
+            border-color: var(--accent-cyan);
+            color: var(--accent-cyan);
         }
 
         /* 响应式 */
@@ -614,12 +741,32 @@
 
     <!-- 日志详情模态框 -->
     <div class="modal-overlay" id="log-modal">
-        <div class="modal">
+        <div class="modal" id="log-modal-dialog">
             <div class="modal-header">
-                <h3 class="modal-title">WAL 日志详情</h3>
-                <button class="modal-close" onclick="closeModal()">&times;</button>
+                <h3 class="modal-title" id="modal-title-text">WAL 日志详情</h3>
+                <div class="modal-header-btns">
+                    <button class="modal-btn" onclick="toggleModalMax('log-modal-dialog')" title="放大/还原">&#x26F6;</button>
+                    <button class="modal-close" onclick="closeModal()">&times;</button>
+                </div>
             </div>
             <div class="modal-body" id="log-detail"></div>
+        </div>
+    </div>
+
+    <!-- 分组放大模态框 -->
+    <div class="modal-overlay" id="group-modal">
+        <div class="modal" id="group-modal-dialog">
+            <div class="modal-header">
+                <h3 class="modal-title" id="group-modal-title">分组详情</h3>
+                <div class="modal-header-btns">
+                    <button class="modal-btn" onclick="toggleModalMax('group-modal-dialog')" title="放大/还原">&#x26F6;</button>
+                    <button class="modal-close" onclick="closeGroupModal()">&times;</button>
+                </div>
+            </div>
+            <div class="modal-body" id="group-modal-body">
+                <div class="group-content" id="gm-content"></div>
+                <div class="group-pagination" id="gm-pager"></div>
+            </div>
         </div>
     </div>
 
@@ -632,6 +779,11 @@
         let totalLogs = 0;
         let filters = { xid: '', pageid: '', plsn: '', type: '', stream: '' };
         let walTypes = [];
+
+        // 分组页签分页状态
+        let groupPage = 1;
+        let groupPageSizeVal = 20;
+        let totalGroups = 0;
 
         // 初始化
         document.addEventListener('DOMContentLoaded', () => {
@@ -647,6 +799,7 @@
                     tab.classList.add('active');
                     currentView = tab.dataset.view;
                     currentPage = 1;
+                    groupPage = 1;
                     loadContent();
                 });
             });
@@ -654,6 +807,9 @@
             // 模态框关闭
             document.getElementById('log-modal').addEventListener('click', e => {
                 if (e.target.classList.contains('modal-overlay')) closeModal();
+            });
+            document.getElementById('group-modal').addEventListener('click', e => {
+                if (e.target.classList.contains('modal-overlay')) closeGroupModal();
             });
         }
 
@@ -696,6 +852,7 @@
         function selectServer(serverId) {
             currentServerId = serverId;
             currentPage = 1;
+            groupPage = 1;
 
             document.querySelectorAll('.server-item').forEach(item => {
                 item.classList.toggle('active', item.dataset.id === serverId);
@@ -753,8 +910,10 @@
             }
 
             if (currentView === 'all') {
+                document.getElementById('pagination').style.display = '';
                 await loadAllLogs();
             } else {
+                document.getElementById('pagination').style.display = 'none';
                 await loadGroupedLogs();
             }
         }
@@ -783,6 +942,13 @@
                 }
 
                 container.innerHTML = `
+                    <div class="page-size-bar">
+                        <label>每页条数:</label>
+                        <select class="page-size-select" onchange="changePageSize(this.value)">
+                            ${[20, 50, 100, 200].map(n => `<option value="${n}" ${n === pageSize ? 'selected' : ''}>${n}</option>`).join('')}
+                        </select>
+                        <span style="color:var(--text-muted);margin-left:0.5rem;">共 ${totalLogs} 条</span>
+                    </div>
                     <div class="wal-table-container">
                         <table class="wal-table">
                             <thead>
@@ -820,59 +986,164 @@
             }
         }
 
+        let groupItemPageSize = 50;
+        const groupPageState = {};  // { key: { page: 1, total: 0, loaded: false } }
+
         async function loadGroupedLogs() {
             const container = document.getElementById('content-area');
+            Object.keys(groupPageState).forEach(k => delete groupPageState[k]);
 
             try {
                 const groupBy = currentView.replace('by-', '');
-                let url = `/api/logs/grouped?server_id=${currentServerId}&group_by=${groupBy}`;
-
+                const offset = (groupPage - 1) * groupPageSizeVal;
+                let url = `/api/logs/grouped?server_id=${currentServerId}&group_by=${groupBy}&limit=${groupPageSizeVal}&offset=${offset}`;
                 if (filters.type) url += `&type=${encodeURIComponent(filters.type)}`;
 
                 const res = await fetch(url);
                 const data = await res.json();
 
+                totalGroups = data.total_groups || 0;
+
                 if (!data.groups || data.groups.length === 0) {
                     container.innerHTML = '<div class="empty-state"><div class="empty-icon">📭</div><p>暂无分组数据</p></div>';
-                    document.getElementById('pagination').style.display = 'none';
                     return;
                 }
 
-                container.innerHTML = `
+                const totalGroupPages = Math.ceil(totalGroups / groupPageSizeVal);
+
+                let html = `
+                    <div class="page-size-bar">
+                        <label>每页分组数:</label>
+                        <select class="page-size-select" onchange="changeGroupPageSize(this.value)">
+                            ${[10, 20, 50, 100].map(n => `<option value="${n}" ${n === groupPageSizeVal ? 'selected' : ''}>${n}</option>`).join('')}
+                        </select>
+                        <span style="color:var(--text-muted);margin-left:0.5rem;">共 ${totalGroups} 个分组</span>
+                    </div>
                     <div class="group-view">
-                        ${data.groups.map(group => `
-                            <div class="group-card" data-key="${group.key}">
-                                <div class="group-header" onclick="toggleGroup(this)">
-                                    <span class="group-title">${getGroupLabel(groupBy)}: ${group.key || '(空)'}</span>
+                        ${data.groups.map((group, idx) => {
+                            groupPageState[idx] = { page: 1, total: group.count, loaded: false };
+                            const safeKey = (group.key || '').replace(/'/g, "\\'");
+                            return `
+                            <div class="group-card" data-idx="${idx}" data-key="${group.key}" data-groupby="${groupBy}">
+                                <div class="group-header">
+                                    <span class="group-title" style="cursor:pointer;flex:1;" onclick="toggleGroupLoad(this.parentElement, ${idx}, '${groupBy}', '${safeKey}')">${getGroupLabel(groupBy)}: ${group.key || '(空)'}</span>
                                     <span class="group-count">${group.count} 条</span>
+                                    <button class="group-expand-btn" onclick="event.stopPropagation();openGroupModal(${idx},'${groupBy}','${safeKey}','${(group.key||'').replace(/'/g,"\\'")}',${group.count})" title="放大查看">&#x26F6;</button>
                                 </div>
                                 <div class="group-body">
-                                    ${group.items.map(item => `
-                                        <div class="group-item" onclick='showLogDetail(${JSON.stringify(item)})'>
-                                            ${groupBy === 'pageid' && item.page_prev_glsn ? `<span style="color: var(--text-muted);">Prev GLSN:</span> ${item.page_prev_glsn} <span style="color: var(--text-muted); margin-left: 0.5rem;">|</span> ` : ''}
-                                            <span style="color: var(--text-muted); margin-left: ${groupBy === 'pageid' ? '0.5rem' : '0'};">PLSN:</span> ${item.plsn || '-'}
-                                            <span style="color: var(--text-muted); margin-left: 1rem;">XID:</span> ${item.xid || '-'}
-                                            <span style="color: var(--text-muted); margin-left: 1rem;">类型:</span>
-                                            <span class="wal-type ${getTypeClass(item.type)}">${item.type || '-'}</span>
-                                        </div>
-                                    `).join('')}
-                                    ${group.count > group.items.length ? `
-                                        <div class="group-item" style="text-align: center; color: var(--accent-cyan); cursor: pointer;"
-                                             onclick="viewAllInGroup('${groupBy}', '${group.key}')">
-                                            查看全部 ${group.count} 条 →
-                                        </div>
-                                    ` : ''}
+                                    <div class="group-content" id="group-content-${idx}">
+                                        <div class="loading"><div class="spinner"></div></div>
+                                    </div>
+                                    <div class="group-pagination" id="group-pager-${idx}"></div>
                                 </div>
-                            </div>
-                        `).join('')}
+                            </div>`;
+                        }).join('')}
                     </div>
                 `;
 
-                document.getElementById('pagination').style.display = 'none';
+                // 分组级别分页
+                if (totalGroupPages > 1) {
+                    html += `<div class="pagination" style="margin-top:1.5rem;">`;
+                    html += `<button class="page-btn" onclick="goGroupPage(1)" ${groupPage===1?'disabled':''}>首页</button>`;
+                    html += `<button class="page-btn" onclick="goGroupPage(${groupPage-1})" ${groupPage===1?'disabled':''}>上一页</button>`;
+                    const gs = Math.max(1, groupPage - 2), ge = Math.min(totalGroupPages, groupPage + 2);
+                    for (let i = gs; i <= ge; i++) {
+                        html += `<button class="page-btn ${i===groupPage?'active':''}" onclick="goGroupPage(${i})">${i}</button>`;
+                    }
+                    html += `<button class="page-btn" onclick="goGroupPage(${groupPage+1})" ${groupPage>=totalGroupPages?'disabled':''}>下一页</button>`;
+                    html += `<button class="page-btn" onclick="goGroupPage(${totalGroupPages})" ${groupPage>=totalGroupPages?'disabled':''}>末页</button>`;
+                    html += `<span class="page-info">${groupPage} / ${totalGroupPages} 页</span>`;
+                    html += `<span class="page-jump"><input type="number" class="page-jump-input" id="page-jump-group" min="1" max="${totalGroupPages}" placeholder="页码" onkeydown="if(event.key==='Enter')jumpToPage('group',${totalGroupPages})"><button class="page-jump-btn" onclick="jumpToPage('group',${totalGroupPages})">跳转</button></span>`;
+                    html += `</div>`;
+                }
+
+                container.innerHTML = html;
             } catch (e) {
                 console.error('加载分组失败:', e);
                 container.innerHTML = '<div class="empty-state"><div class="empty-icon">⚠️</div><p>加载失败</p></div>';
             }
+        }
+
+        function goGroupPage(page) {
+            groupPage = page;
+            loadGroupedLogs();
+            window.scrollTo(0, 0);
+        }
+
+        function changeGroupPageSize(val) {
+            groupPageSizeVal = parseInt(val);
+            groupPage = 1;
+            loadGroupedLogs();
+        }
+
+        async function toggleGroupLoad(header, idx, groupBy, key) {
+            const card = header.parentElement;
+            const wasExpanded = card.classList.contains('expanded');
+            card.classList.toggle('expanded');
+            if (wasExpanded) return;
+
+            if (!groupPageState[idx].loaded) {
+                groupPageState[idx].loaded = true;
+                await loadGroupPage(idx, groupBy, key, 1);
+            }
+        }
+
+        async function loadGroupPage(idx, groupBy, key, page) {
+            const contentEl = document.getElementById(`group-content-${idx}`);
+            const pagerEl = document.getElementById(`group-pager-${idx}`);
+            contentEl.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+
+            const offset = (page - 1) * groupItemPageSize;
+            let url = `/api/logs/group-detail?server_id=${currentServerId}&group_by=${groupBy}&key=${encodeURIComponent(key)}&limit=${groupItemPageSize}&offset=${offset}`;
+            if (filters.type) url += `&type=${encodeURIComponent(filters.type)}`;
+
+            try {
+                const res = await fetch(url);
+                const data = await res.json();
+                groupPageState[idx].page = page;
+                groupPageState[idx].total = data.total;
+
+                contentEl.innerHTML = data.items.map(item => `
+                    <div class="group-item" onclick='showLogDetail(${JSON.stringify(item)})'>
+                        ${groupBy === 'pageid' && item.page_prev_glsn != null ? `<span style="color: var(--text-muted);">Prev GLSN:</span> ${item.page_prev_glsn} <span style="color: var(--text-muted); margin-left: 0.5rem;">|</span> ` : ''}
+                        <span style="color: var(--text-muted);">PLSN:</span> ${item.plsn || '-'}
+                        <span style="color: var(--text-muted); margin-left: 1rem;">XID:</span> ${item.xid || '-'}
+                        <span style="color: var(--text-muted); margin-left: 1rem;">类型:</span>
+                        <span class="wal-type ${getTypeClass(item.type)}">${item.type || '-'}</span>
+                    </div>
+                `).join('');
+
+                // 分页控件
+                const totalPages = Math.ceil(data.total / groupItemPageSize);
+                const safeKey = key.replace(/'/g, "\\'");
+                let ph = `<div style="display:flex;justify-content:center;align-items:center;gap:0.5rem;padding:0.75rem;flex-wrap:wrap;">`;
+                ph += `<label style="color:var(--text-secondary);font-size:0.8rem;">每页:</label>`;
+                ph += `<select class="page-size-select" style="font-size:0.8rem;padding:0.25rem 0.4rem;" onchange="changeGroupItemPageSize(${idx},'${groupBy}','${safeKey}',this.value)">`;
+                [20, 50, 100, 200].forEach(n => { ph += `<option value="${n}" ${n===groupItemPageSize?'selected':''}>${n}</option>`; });
+                ph += `</select>`;
+                if (totalPages > 1) {
+                    ph += `<button class="page-btn" style="padding:0.35rem 0.75rem;font-size:0.8rem;" ${page<=1?'disabled':''} onclick="loadGroupPage(${idx},'${groupBy}','${safeKey}',${page-1})">上一页</button>`;
+                    const start = Math.max(1, page - 2), end = Math.min(totalPages, page + 2);
+                    for (let i = start; i <= end; i++) {
+                        ph += `<button class="page-btn ${i===page?'active':''}" style="padding:0.35rem 0.75rem;font-size:0.8rem;" onclick="loadGroupPage(${idx},'${groupBy}','${safeKey}',${i})">${i}</button>`;
+                    }
+                    ph += `<button class="page-btn" style="padding:0.35rem 0.75rem;font-size:0.8rem;" ${page>=totalPages?'disabled':''} onclick="loadGroupPage(${idx},'${groupBy}','${safeKey}',${page+1})">下一页</button>`;
+                }
+                ph += `<span class="page-info" style="font-size:0.8rem;">${data.total} 条 / ${totalPages} 页</span>`;
+                if (totalPages > 1) {
+                    ph += `<span class="page-jump"><input type="number" class="page-jump-input" id="page-jump-gi-${idx}" min="1" max="${totalPages}" placeholder="页码" style="font-size:0.75rem;width:46px;" onkeydown="if(event.key==='Enter')jumpGroupItemPage(${idx},'${groupBy}','${safeKey}',${totalPages})"><button class="page-jump-btn" style="font-size:0.75rem;padding:0.25rem 0.5rem;" onclick="jumpGroupItemPage(${idx},'${groupBy}','${safeKey}',${totalPages})">跳转</button></span>`;
+                }
+                ph += `</div>`;
+                pagerEl.innerHTML = ph;
+            } catch (e) {
+                contentEl.innerHTML = '<div class="group-item" style="color:var(--accent-red);">加载失败</div>';
+            }
+        }
+
+        function changeGroupItemPageSize(idx, groupBy, key, val) {
+            groupItemPageSize = parseInt(val);
+            groupPageState[idx].page = 1;
+            loadGroupPage(idx, groupBy, key, 1);
         }
 
         function toggleGroup(header) {
@@ -937,6 +1208,7 @@
             filters.type = document.getElementById('filter-type').value;
 
             currentPage = 1;
+            groupPage = 1;
             loadContent();
         }
 
@@ -948,6 +1220,7 @@
             document.getElementById('filter-type').value = '';
 
             currentPage = 1;
+            groupPage = 1;
             loadContent();
         }
 
@@ -978,6 +1251,11 @@
                 <button class="page-btn" onclick="goToPage(${currentPage + 1})" ${currentPage === totalPages ? 'disabled' : ''}>下一页</button>
                 <button class="page-btn" onclick="goToPage(${totalPages})" ${currentPage === totalPages ? 'disabled' : ''}>末页</button>
                 <span class="page-info">共 ${totalLogs} 条，${totalPages} 页</span>
+                <span class="page-jump">
+                    <input type="number" class="page-jump-input" id="page-jump-all" min="1" max="${totalPages}" placeholder="页码"
+                        onkeydown="if(event.key==='Enter')jumpToPage('all',${totalPages})">
+                    <button class="page-jump-btn" onclick="jumpToPage('all',${totalPages})">跳转</button>
+                </span>
             `;
 
             pagination.innerHTML = html;
@@ -987,6 +1265,28 @@
             currentPage = page;
             loadContent();
             window.scrollTo(0, 0);
+        }
+
+        function changePageSize(val) {
+            pageSize = parseInt(val);
+            currentPage = 1;
+            loadContent();
+        }
+
+        function jumpToPage(type, totalPages) {
+            const inputId = type === 'all' ? 'page-jump-all' : 'page-jump-group';
+            const input = document.getElementById(inputId);
+            const p = parseInt(input.value);
+            if (!p || p < 1 || p > totalPages) { input.value = ''; return; }
+            if (type === 'all') goToPage(p);
+            else goGroupPage(p);
+        }
+
+        function jumpGroupItemPage(idx, groupBy, key, totalPages) {
+            const input = document.getElementById(`page-jump-gi-${idx}`);
+            const p = parseInt(input.value);
+            if (!p || p < 1 || p > totalPages) { input.value = ''; return; }
+            loadGroupPage(idx, groupBy, key, p);
         }
 
         function showLogDetail(log) {
@@ -1029,6 +1329,77 @@
 
         function closeModal() {
             document.getElementById('log-modal').classList.remove('active');
+            document.getElementById('log-modal-dialog').classList.remove('maximized');
+        }
+
+        function toggleModalMax(dialogId) {
+            document.getElementById(dialogId).classList.toggle('maximized');
+        }
+
+        // 分组放大模态框
+        let gmState = { groupBy: '', key: '', page: 1, total: 0 };
+
+        function openGroupModal(idx, groupBy, safeKey, displayKey, count) {
+            gmState = { groupBy, key: safeKey, page: 1, total: count };
+            document.getElementById('group-modal-title').textContent = `${getGroupLabel(groupBy)}: ${displayKey || '(空)'}  (${count} 条)`;
+            document.getElementById('group-modal').classList.add('active');
+            document.getElementById('group-modal-dialog').classList.remove('maximized');
+            loadGroupModalPage(1);
+        }
+
+        function closeGroupModal() {
+            document.getElementById('group-modal').classList.remove('active');
+            document.getElementById('group-modal-dialog').classList.remove('maximized');
+        }
+
+        async function loadGroupModalPage(page) {
+            const contentEl = document.getElementById('gm-content');
+            const pagerEl = document.getElementById('gm-pager');
+            contentEl.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+
+            const offset = (page - 1) * groupItemPageSize;
+            let url = `/api/logs/group-detail?server_id=${currentServerId}&group_by=${gmState.groupBy}&key=${encodeURIComponent(gmState.key)}&limit=${groupItemPageSize}&offset=${offset}`;
+            if (filters.type) url += `&type=${encodeURIComponent(filters.type)}`;
+
+            try {
+                const res = await fetch(url);
+                const data = await res.json();
+                gmState.page = page;
+                gmState.total = data.total;
+
+                contentEl.innerHTML = data.items.map(item => `
+                    <div class="group-item" style="cursor:pointer;" onclick='showLogDetail(${JSON.stringify(item)})'>
+                        ${gmState.groupBy === 'pageid' && item.page_prev_glsn != null ? `<span style="color: var(--text-muted);">Prev GLSN:</span> ${item.page_prev_glsn} <span style="color: var(--text-muted); margin-left: 0.5rem;">|</span> ` : ''}
+                        <span style="color: var(--text-muted);">PLSN:</span> ${item.plsn || '-'}
+                        <span style="color: var(--text-muted); margin-left: 1rem;">XID:</span> ${item.xid || '-'}
+                        <span style="color: var(--text-muted); margin-left: 1rem;">类型:</span>
+                        <span class="wal-type ${getTypeClass(item.type)}">${item.type || '-'}</span>
+                    </div>
+                `).join('');
+
+                const totalPages = Math.ceil(data.total / groupItemPageSize);
+                let ph = `<div style="display:flex;justify-content:center;align-items:center;gap:0.5rem;padding:0.75rem;flex-wrap:wrap;">`;
+                ph += `<label style="color:var(--text-secondary);font-size:0.8rem;">每页:</label>`;
+                ph += `<select class="page-size-select" style="font-size:0.8rem;padding:0.25rem 0.4rem;" onchange="groupItemPageSize=parseInt(this.value);loadGroupModalPage(1)">`;
+                [20, 50, 100, 200].forEach(n => { ph += `<option value="${n}" ${n===groupItemPageSize?'selected':''}>${n}</option>`; });
+                ph += `</select>`;
+                if (totalPages > 1) {
+                    ph += `<button class="page-btn" style="padding:0.35rem 0.75rem;font-size:0.8rem;" ${page<=1?'disabled':''} onclick="loadGroupModalPage(${page-1})">上一页</button>`;
+                    const start = Math.max(1, page - 2), end = Math.min(totalPages, page + 2);
+                    for (let i = start; i <= end; i++) {
+                        ph += `<button class="page-btn ${i===page?'active':''}" style="padding:0.35rem 0.75rem;font-size:0.8rem;" onclick="loadGroupModalPage(${i})">${i}</button>`;
+                    }
+                    ph += `<button class="page-btn" style="padding:0.35rem 0.75rem;font-size:0.8rem;" ${page>=totalPages?'disabled':''} onclick="loadGroupModalPage(${page+1})">下一页</button>`;
+                }
+                ph += `<span class="page-info" style="font-size:0.8rem;">${data.total} 条 / ${totalPages} 页</span>`;
+                if (totalPages > 1) {
+                    ph += `<span class="page-jump"><input type="number" class="page-jump-input" id="page-jump-gm" min="1" max="${totalPages}" placeholder="页码" style="font-size:0.75rem;width:46px;" onkeydown="if(event.key==='Enter'){var v=parseInt(this.value);if(v>=1&&v<=${totalPages})loadGroupModalPage(v);}"><button class="page-jump-btn" style="font-size:0.75rem;padding:0.25rem 0.5rem;" onclick="var v=parseInt(document.getElementById('page-jump-gm').value);if(v>=1&&v<=${totalPages})loadGroupModalPage(v);">跳转</button></span>`;
+                }
+                ph += `</div>`;
+                pagerEl.innerHTML = ph;
+            } catch (e) {
+                contentEl.innerHTML = '<div class="group-item" style="color:var(--accent-red);">加载失败</div>';
+            }
         }
 
         function refreshData() {
