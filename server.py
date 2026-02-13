@@ -144,6 +144,8 @@ class Handler(BaseHTTPRequestHandler):
             '/api/logs/group-detail': lambda: self._logs_in_group(q),
             '/api/wal-types': lambda: self._wal_types(q),
             '/api/servers': self._servers,
+            '/api/analysis/hot-pages': lambda: self._analysis_hot_pages(q),
+            '/api/analysis/tx-integrity': lambda: self._analysis_tx_integrity(q),
         }
         handler = routes.get(p.path)
         if handler:
@@ -359,6 +361,151 @@ class Handler(BaseHTTPRequestHandler):
                         'total_logs': r['total_logs'], 'last_seen': r['last_seen']} for r in cur.fetchall()]
             cur.close()
         self._send({'servers': servers})
+
+    def _analysis_hot_pages(self, q):
+        """热点页面检测 - 分析最频繁修改的页面"""
+        server_id = q.get('server_id', [None])[0]
+        time_range = int(q.get('time_range', ['60'])[0])  # 分钟，0 表示全部时间
+        limit = min(int(q.get('limit', ['50'])[0]), 200)
+
+        conds, vals = [], []
+        if server_id:
+            conds.append('server_id = %s')
+            vals.append(server_id)
+        if time_range > 0:
+            conds.append("received_at > NOW() - INTERVAL '%s minutes'")
+            vals.append(time_range)
+        where = ' AND '.join(conds) if conds else '1=1'
+
+        with get_db() as conn:
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            # 热点页面统计
+            cur.execute(f'''
+                SELECT
+                    page_id,
+                    COUNT(*) as modify_count,
+                    COUNT(DISTINCT xid) as tx_count,
+                    ARRAY_AGG(DISTINCT type ORDER BY type) as op_types,
+                    MIN(received_at) as first_seen,
+                    MAX(received_at) as last_seen,
+                    COUNT(DISTINCT server_id) as server_count
+                FROM log_entries
+                WHERE {where} AND page_id IS NOT NULL
+                GROUP BY page_id
+                ORDER BY modify_count DESC
+                LIMIT %s
+            ''', vals + [limit])
+            hot_pages = []
+            for r in cur.fetchall():
+                hot_pages.append({
+                    'page_id': r['page_id'],
+                    'modify_count': r['modify_count'],
+                    'tx_count': r['tx_count'],
+                    'op_types': r['op_types'] or [],
+                    'first_seen': str(r['first_seen']),
+                    'last_seen': str(r['last_seen']),
+                    'server_count': r['server_count'],
+                })
+            cur.close()
+
+        self._send({
+            'hot_pages': hot_pages,
+            'time_range_minutes': time_range,
+            'total': len(hot_pages)
+        })
+
+    def _analysis_tx_integrity(self, q):
+        """事务完整性分析 - 检测孤儿事务、长事务、异常事务"""
+        server_id = q.get('server_id', [None])[0]
+        min_wal_count = int(q.get('min_wal_count', ['10'])[0])
+        limit = min(int(q.get('limit', ['100'])[0]), 500)
+
+        where = ''
+        base_vals = []
+        if server_id:
+            where = 'AND server_id = %s'
+            base_vals = [server_id]
+
+        with get_db() as conn:
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+
+            # 1. 孤儿事务（无 COMMIT/ABORT 记录的事务）
+            cur.execute(f'''
+                WITH tx_stats AS (
+                    SELECT
+                        xid,
+                        COUNT(*) as wal_count,
+                        MIN(received_at) as start_time,
+                        MAX(received_at) as end_time,
+                        BOOL_OR(type LIKE '%%COMMIT%%' OR type LIKE '%%ABORT%%') as has_commit,
+                        ARRAY_AGG(DISTINCT type ORDER BY type) as op_types,
+                        COUNT(DISTINCT page_id) as page_count,
+                        server_id,
+                        hostname
+                    FROM log_entries
+                    WHERE xid IS NOT NULL {where}
+                    GROUP BY xid, server_id, hostname
+                    HAVING COUNT(*) >= %s
+                )
+                SELECT * FROM tx_stats
+                WHERE has_commit = FALSE
+                ORDER BY wal_count DESC
+                LIMIT %s
+            ''', base_vals + [min_wal_count, limit])
+            orphan_txs = []
+            for r in cur.fetchall():
+                orphan_txs.append({
+                    'xid': r['xid'],
+                    'wal_count': r['wal_count'],
+                    'start_time': str(r['start_time']),
+                    'end_time': str(r['end_time']),
+                    'op_types': r['op_types'] or [],
+                    'page_count': r['page_count'],
+                    'server_id': r['server_id'],
+                    'hostname': r['hostname'],
+                })
+
+            # 2. 高WAL事务（WAL记录数异常多）
+            cur.execute(f'''
+                WITH tx_stats AS (
+                    SELECT
+                        xid,
+                        COUNT(*) as wal_count,
+                        MIN(received_at) as start_time,
+                        MAX(received_at) as end_time,
+                        ARRAY_AGG(DISTINCT type ORDER BY type) as op_types,
+                        COUNT(DISTINCT page_id) as page_count,
+                        server_id,
+                        hostname
+                    FROM log_entries
+                    WHERE xid IS NOT NULL {where}
+                    GROUP BY xid, server_id, hostname
+                )
+                SELECT * FROM tx_stats
+                ORDER BY wal_count DESC
+                LIMIT %s
+            ''', base_vals + [limit])
+            high_wal_txs = []
+            for r in cur.fetchall():
+                high_wal_txs.append({
+                    'xid': r['xid'],
+                    'wal_count': r['wal_count'],
+                    'start_time': str(r['start_time']),
+                    'end_time': str(r['end_time']),
+                    'op_types': r['op_types'] or [],
+                    'page_count': r['page_count'],
+                    'server_id': r['server_id'],
+                    'hostname': r['hostname'],
+                })
+
+            cur.close()
+
+        self._send({
+            'orphan_transactions': orphan_txs,
+            'high_wal_transactions': high_wal_txs,
+            'total_orphan': len(orphan_txs),
+            'total_high_wal': len(high_wal_txs),
+        })
 
     def _dashboard(self):
         try:
