@@ -20,12 +20,15 @@ import hashlib
 import json
 import os
 import platform
+import re
 import signal
 import socket
 import sys
 import time
+import threading
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==================== 配置 ====================
 SERVER_URL = os.environ.get('LOG_SERVER_URL', 'http://localhost:8080')
@@ -34,6 +37,35 @@ BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '5000'))
 WAL_FILE = os.environ.get('WAL_LOG_FILE', '/var/log/wal/wal.log')
 CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', '30'))
 WORKERS = int(os.environ.get('UPLOAD_WORKERS', '4'))
+
+
+# WAL 解析正则（与服务端保持一致）
+WAL_PATTERN = re.compile(
+    r'dump_stream_(?P<stream>[\d_]+):.*?'
+    r'plsn:(?P<plsn>\d+);.*?'
+    r'xid:\s*\((?P<xid_h>\d+),\s*(?P<xid_l>\d+)\);.*?'
+    r'type:(?P<type>\w+);.*?'
+    r'pageId=\((?P<pg1>\d+),\s*(?P<pg2>\d+)\);.*?'
+    r'page prev glsn:(?P<prev_glsn>\d+)',
+    re.IGNORECASE
+)
+
+
+def parse_wal_line(line):
+    """客户端预解析 WAL 行，减少服务端 CPU 压力"""
+    m = WAL_PATTERN.search(line)
+    if m:
+        return {
+            'stream': m.group('stream'),
+            'plsn': m.group('plsn'),
+            'xid': f"({m.group('xid_h')},{m.group('xid_l')})",
+            'type': m.group('type'),
+            'page_id': f"({m.group('pg1')},{m.group('pg2')})",
+            'page_prev_glsn': int(m.group('prev_glsn')),
+            'message': line,
+        }
+    return {'stream': None, 'plsn': None, 'xid': None, 'type': None,
+            'page_id': None, 'page_prev_glsn': None, 'message': line}
 
 
 # ==================== 工具 ====================
@@ -115,13 +147,13 @@ def register_server():
 
 
 # ==================== 上传核心 ====================
-def upload_batch(server_id, hostname, lines):
-    """上传一批日志行"""
+def upload_batch(server_id, hostname, records):
+    """上传一批预解析的结构化记录"""
     resp = post_json('/api/upload', {
         'server_id': server_id,
         'hostname': hostname,
         'log_type': 'wal',
-        'logs': lines,
+        'records': records,  # 预解析字段，服务端直接 COPY 入库
     })
     return resp.get('success', False), resp.get('inserted', 0), resp.get('error', '')
 
@@ -129,8 +161,9 @@ def upload_batch(server_id, hostname, lines):
 def upload_file(filepath, server_id, start_pos=0):
     """
     高性能文件上传
-    - 从 start_pos 字节位置开始读取
-    - 按 BATCH_SIZE 分批发送
+    - 客户端预解析 WAL（省去服务端正则开销）
+    - WORKERS 个线程并发发送批次（IO 并行，绕开 GIL）
+    - 主线程负责读文件 + 解析，工作线程负责网络发送
     - 返回 (已上传行数, 结束字节位置)
     """
     hostname = get_hostname()
@@ -139,61 +172,82 @@ def upload_file(filepath, server_id, start_pos=0):
     if start_pos >= file_size:
         return 0, start_pos
 
-    total_lines = 0
-    total_sent = 0
-    failed = 0
-    batch = []
+    # 用列表做线程安全的可变计数器
+    counters = {'sent': 0, 'failed_batches': 0}
+    counter_lock = threading.Lock()
     t0 = time.time()
-    last_report = t0
+    last_report = [t0]
+
+    def send_fn(records):
+        ok, inserted, err = upload_batch(server_id, hostname, records)
+        with counter_lock:
+            if ok:
+                counters['sent'] += inserted
+            else:
+                counters['failed_batches'] += 1
+                print(f'\r[WARN] 批次失败: {err}')
+
+    def print_progress(pos):
+        now = time.time()
+        if now - last_report[0] < 2:
+            return
+        last_report[0] = now
+        elapsed = now - t0
+        speed = counters['sent'] / elapsed if elapsed > 0 else 0
+        pct = (pos - start_pos) / (file_size - start_pos) * 100 if file_size > start_pos else 100
+        eta = (file_size - pos) / ((pos - start_pos) / elapsed) if pos > start_pos and elapsed > 0 else 0
+        print(f'\r[进度] {pct:.1f}% | 已发送 {fmt_num(counters["sent"])} 条 | '
+              f'速度 {fmt_num(int(speed))} 条/s | 剩余 {fmt_time(eta)} | '
+              f'并发 {WORKERS} 线程', end='', flush=True)
+
+    batch = []
+    pending = []
 
     with open(filepath, 'r', errors='replace') as f:
         if start_pos > 0:
             f.seek(start_pos)
 
-        for line in f:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            batch.append(stripped)
-            total_lines += 1
+        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                batch.append(parse_wal_line(stripped))
 
-            if len(batch) >= BATCH_SIZE:
-                ok, inserted, err = upload_batch(server_id, hostname, batch)
-                if ok:
-                    total_sent += inserted
-                else:
-                    failed += len(batch)
-                    print(f'\r[WARN] 批次上传失败: {err}')
-                batch = []
+                if len(batch) >= BATCH_SIZE:
+                    pending.append(executor.submit(send_fn, batch))
+                    batch = []
 
-                # 进度报告（每 2 秒）
-                now = time.time()
-                if now - last_report >= 2:
-                    elapsed = now - t0
-                    speed = total_sent / elapsed if elapsed > 0 else 0
-                    pos = f.tell()
-                    pct = (pos - start_pos) / (file_size - start_pos) * 100 if file_size > start_pos else 100
-                    eta = (file_size - pos) / ((pos - start_pos) / elapsed) if pos > start_pos and elapsed > 0 else 0
-                    print(f'\r[进度] {pct:.1f}% | 已发送 {fmt_num(total_sent)} 条 | '
-                          f'速度 {fmt_num(int(speed))} 条/s | 剩余 {fmt_time(eta)}', end='', flush=True)
-                    last_report = now
+                    # 收割已完成的 future，避免列表无限增长
+                    pending = [fut for fut in pending if not fut.done()]
 
-        # 发送剩余
-        if batch:
-            ok, inserted, err = upload_batch(server_id, hostname, batch)
-            if ok:
-                total_sent += inserted
-            else:
-                failed += len(batch)
+                    # 背压控制：积压超过 WORKERS*2 时等待，防止内存撑爆
+                    while len(pending) >= WORKERS * 2:
+                        time.sleep(0.02)
+                        pending = [fut for fut in pending if not fut.done()]
+
+                    print_progress(f.tell())
+
+            # 发送剩余不足一批的记录
+            if batch:
+                pending.append(executor.submit(send_fn, batch))
+
+            # 等待所有批次完成
+            for fut in pending:
+                fut.result()
 
         end_pos = f.tell()
 
     elapsed = time.time() - t0
-    speed = total_sent / elapsed if elapsed > 0 else 0
-    print(f'\r[OK] 完成: 发送 {fmt_num(total_sent)} 条 | 耗时 {fmt_time(elapsed)} | '
-          f'速度 {fmt_num(int(speed))} 条/s' + (f' | 失败 {failed}' if failed else ''))
+    speed = counters['sent'] / elapsed if elapsed > 0 else 0
+    fb = counters['failed_batches']
+    print(f'\r[OK] 完成: 发送 {fmt_num(counters["sent"])} 条 | 耗时 {fmt_time(elapsed)} | '
+          f'速度 {fmt_num(int(speed))} 条/s' + (f' | 失败批次 {fb}' if fb else ''))
 
-    return total_sent, end_pos
+    return counters['sent'], end_pos
 
 
 def upload_file_incremental(filepath, server_id):
@@ -277,7 +331,7 @@ def main():
     parser.add_argument('--file', type=str, help='上传指定文件')
     parser.add_argument('--daemon', action='store_true', help='守护进程模式')
     parser.add_argument('--status', action='store_true', help='查看状态')
-    parser.add_argument('--batch-size', type=int, help=f'批量大小 (默认: {BATCH_SIZE})')
+    parser.add_argument('--batch-size', type=int, help='批量大小 (默认: 5000)')
     args = parser.parse_args()
 
     if args.batch_size:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """WAL 日志收集分析平台 - 后端服务"""
 
+import io
 import json
 import os
 import re
@@ -11,7 +12,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 import psycopg2
-from psycopg2.extras import RealDictCursor, execute_values
+from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
 
 # ==================== 配置 ====================
@@ -26,8 +27,17 @@ HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
 PORT = int(os.environ.get('SERVER_PORT', 8080))
 
 db_pool = None
+_known_partitions = set()  # 内存缓存已知 server_id，避免每次查 pg_class
 
-# WAL 日志解析正则
+
+def _pg_escape(v):
+    """PostgreSQL TEXT 格式转义：NULL 用 \\N，特殊字符转义"""
+    if v is None:
+        return r'\N'
+    return str(v).replace('\\', '\\\\').replace('\t', '\\t').replace('\n', '\\n').replace('\r', '\\r')
+
+
+# WAL 日志解析正则（保留用于兼容旧格式上传）
 WAL_PATTERN = re.compile(
     r'dump_stream_(?P<stream>[\d_]+):.*?'
     r'plsn:(?P<plsn>\d+);.*?'
@@ -54,31 +64,109 @@ def get_db():
         db_pool.putconn(conn)
 
 
+def ensure_partition(cur, server_id):
+    """为 server_id 创建分区（如果不存在），内存缓存避免重复查 pg_class"""
+    if server_id in _known_partitions:
+        return
+    safe_name = server_id.replace('-', '_')
+    partition_name = f'log_entries_{safe_name}'
+    cur.execute("SELECT 1 FROM pg_class WHERE relname = %s", (partition_name,))
+    if not cur.fetchone():
+        cur.execute(f'''
+            CREATE TABLE IF NOT EXISTS {partition_name}
+            PARTITION OF log_entries FOR VALUES IN (%s)
+        ''', (server_id,))
+        # 在分区上创建复合索引
+        for idx_cols, idx_suffix in [
+            ('server_id, received_at', 'rcv'),
+            ('server_id, xid', 'xid'),
+            ('server_id, page_id', 'pgid'),
+            ('server_id, type', 'type'),
+            ('server_id, stream', 'strm'),
+            ('server_id, plsn', 'plsn'),
+            ('page_id, page_prev_glsn', 'pg_glsn'),
+        ]:
+            cur.execute(f'CREATE INDEX IF NOT EXISTS idx_{safe_name}_{idx_suffix} ON {partition_name}({idx_cols})')
+        print(f"  📂 创建分区: {partition_name} (server_id={server_id})")
+    _known_partitions.add(server_id)
+
+
 def init_db():
-    """初始化数据库"""
+    """初始化数据库 - 使用 LIST 分区表"""
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS log_entries (
-                id SERIAL PRIMARY KEY,
-                server_id VARCHAR(64) NOT NULL,
-                hostname VARCHAR(255),
-                log_type VARCHAR(50) DEFAULT 'wal',
-                received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                stream VARCHAR(32),
-                plsn TEXT, xid TEXT, type VARCHAR(128), page_id TEXT,
-                page_prev_glsn BIGINT,
-                message TEXT
-            )
-        ''')
-        # 添加新列（如果不存在）
-        cur.execute('''
-            DO $$ BEGIN
-                ALTER TABLE log_entries ADD COLUMN IF NOT EXISTS stream VARCHAR(32);
-                ALTER TABLE log_entries ADD COLUMN IF NOT EXISTS page_prev_glsn BIGINT;
-            EXCEPTION WHEN duplicate_column THEN NULL;
-            END $$;
-        ''')
+
+        # 检查 log_entries 是否已经是分区表
+        cur.execute("""
+            SELECT c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = 'log_entries' AND n.nspname = 'public'
+        """)
+        row = cur.fetchone()
+
+        if row and row[0] == 'p':
+            # 已经是分区表，跳过迁移
+            print("  ✅ log_entries 已是分区表")
+        elif row:
+            # 存在旧的非分区表，执行迁移
+            print("  🔄 迁移: 将 log_entries 转换为分区表...")
+            cur.execute("ALTER TABLE log_entries RENAME TO log_entries_old")
+            cur.execute("DROP INDEX IF EXISTS idx_server_id, idx_plsn, idx_xid, idx_type, idx_page_id, idx_received_at, idx_stream, idx_page_prev_glsn")
+            # 创建分区主表
+            cur.execute('''
+                CREATE TABLE log_entries (
+                    id SERIAL,
+                    server_id VARCHAR(64) NOT NULL,
+                    hostname VARCHAR(255),
+                    log_type VARCHAR(50) DEFAULT 'wal',
+                    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    stream VARCHAR(32),
+                    plsn TEXT, xid TEXT, type VARCHAR(128), page_id TEXT,
+                    page_prev_glsn BIGINT,
+                    message TEXT
+                ) PARTITION BY LIST (server_id)
+            ''')
+            # 为已有的 server_id 创建分区并迁移数据
+            cur.execute("SELECT DISTINCT server_id FROM log_entries_old WHERE server_id IS NOT NULL")
+            existing_ids = [r[0] for r in cur.fetchall()]
+            for sid in existing_ids:
+                ensure_partition(cur, sid)
+            # 迁移数据
+            cur.execute('''
+                INSERT INTO log_entries (id, server_id, hostname, log_type, received_at, stream, plsn, xid, type, page_id, page_prev_glsn, message)
+                SELECT id, server_id, hostname, log_type, received_at, stream, plsn, xid, type, page_id, page_prev_glsn, message
+                FROM log_entries_old
+            ''')
+            cur.execute("SELECT setval('log_entries_id_seq', (SELECT COALESCE(MAX(id), 0) FROM log_entries))")
+            # 创建默认分区
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS log_entries_default
+                PARTITION OF log_entries DEFAULT
+            ''')
+            cur.execute("DROP TABLE log_entries_old")
+            print(f"  ✅ 迁移完成: {len(existing_ids)} 个分区")
+        else:
+            # 全新安装，直接创建分区表
+            cur.execute('''
+                CREATE TABLE log_entries (
+                    id SERIAL,
+                    server_id VARCHAR(64) NOT NULL,
+                    hostname VARCHAR(255),
+                    log_type VARCHAR(50) DEFAULT 'wal',
+                    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    stream VARCHAR(32),
+                    plsn TEXT, xid TEXT, type VARCHAR(128), page_id TEXT,
+                    page_prev_glsn BIGINT,
+                    message TEXT
+                ) PARTITION BY LIST (server_id)
+            ''')
+            # 创建默认分区，接收未知 server_id
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS log_entries_default
+                PARTITION OF log_entries DEFAULT
+            ''')
+            print("  ✅ 创建分区表: log_entries (LIST by server_id)")
+
+        # servers 表不变
         cur.execute('''
             CREATE TABLE IF NOT EXISTS servers (
                 id VARCHAR(64) PRIMARY KEY,
@@ -90,8 +178,21 @@ def init_db():
                 total_logs BIGINT DEFAULT 0
             )
         ''')
-        for idx in ['server_id', 'plsn', 'xid', 'type', 'page_id', 'received_at', 'stream', 'page_prev_glsn']:
-            cur.execute(f'CREATE INDEX IF NOT EXISTS idx_{idx} ON log_entries({idx})')
+
+        # 预热分区缓存
+        cur.execute("SELECT id FROM servers")
+        for row in cur.fetchall():
+            _known_partitions.add(row[0])
+
+        # 打印已有分区
+        cur.execute("""
+            SELECT inhrelid::regclass::text FROM pg_inherits
+            WHERE inhparent = 'log_entries'::regclass
+        """)
+        partitions = [r[0] for r in cur.fetchall()]
+        if partitions:
+            print(f"  📊 已有分区: {', '.join(partitions)}")
+
         cur.close()
     print("✅ 数据库初始化完成")
 
@@ -184,6 +285,8 @@ class Handler(BaseHTTPRequestHandler):
 
         with get_db() as conn:
             cur = conn.cursor()
+            # 注册时自动创建分区
+            ensure_partition(cur, sid)
             cur.execute('''
                 INSERT INTO servers (id, hostname, ip_address, os_info)
                 VALUES (%s, %s, %s, %s)
@@ -197,33 +300,54 @@ class Handler(BaseHTTPRequestHandler):
     def _upload(self, data):
         server_id = data.get('server_id', 'unknown')
         hostname = data.get('hostname', 'unknown')
-        logs = data.get('logs', [])
-        if not logs:
-            return self._send({'error': 'No logs'}, 400)
 
-        rows = []
-        for line in logs:
-            if not line.strip():
-                continue
-            p = parse_wal(line)
-            rows.append((server_id, hostname, 'wal', p['stream'], p['plsn'], p['xid'], p['type'], p['page_id'], p['page_prev_glsn'], p['message']))
+        # 新格式：客户端预解析的结构化字段列表
+        # 旧格式（兼容）：原始日志行列表
+        records = data.get('records')
+        if records is None:
+            logs = data.get('logs', [])
+            if not logs:
+                return self._send({'error': 'No logs'}, 400)
+            records = []
+            for line in logs:
+                if not line.strip():
+                    continue
+                p = parse_wal(line)
+                p['message'] = line
+                records.append(p)
+
+        if not records:
+            return self._send({'error': 'No valid logs'}, 400)
+
+        # 构建 COPY 数据（PostgreSQL TEXT 格式，tab 分隔，\N 表示 NULL）
+        buf = io.StringIO()
+        for r in records:
+            cols = [
+                server_id, hostname, 'wal',
+                r.get('stream'), r.get('plsn'), r.get('xid'),
+                r.get('type'), r.get('page_id'), r.get('page_prev_glsn'),
+                r.get('message', ''),
+            ]
+            buf.write('\t'.join(_pg_escape(v) for v in cols) + '\n')
+        buf.seek(0)
 
         with get_db() as conn:
             cur = conn.cursor()
-            execute_values(cur, '''
-                INSERT INTO log_entries (server_id, hostname, log_type, stream, plsn, xid, type, page_id, page_prev_glsn, message)
-                VALUES %s
-            ''', rows, page_size=500)
+            ensure_partition(cur, server_id)
+            cur.copy_expert(
+                'COPY log_entries (server_id, hostname, log_type, stream, plsn, xid, type, page_id, page_prev_glsn, message) FROM STDIN',
+                buf
+            )
             cur.execute('''
                 INSERT INTO servers (id, hostname, last_seen, total_logs)
                 VALUES (%s, %s, CURRENT_TIMESTAMP, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     last_seen = CURRENT_TIMESTAMP,
                     total_logs = servers.total_logs + EXCLUDED.total_logs
-            ''', (server_id, hostname, len(rows)))
+            ''', (server_id, hostname, len(records)))
             cur.close()
 
-        self._send({'success': True, 'inserted': len(rows)})
+        self._send({'success': True, 'inserted': len(records)})
 
     def _stats(self, q):
         server_id = q.get('server_id', [None])[0]
