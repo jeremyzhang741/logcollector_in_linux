@@ -1,0 +1,404 @@
+  ---
+  DStore Heap 存储引擎详解
+
+  ---
+  一、Heap 页面物理结构
+
+  每个 Heap 页固定大小（BLCKSZ，默认 8KB），布局从低地址到高地址：
+
+  ┌────────────────────────────────────────────────────┐
+  │  PageHeader（含 checksum、glsn、plsn、lower/upper）  │  ← 基类页头
+  ├────────────────────────────────────────────────────┤
+  │  HeapPageHeader                                    │  ← Heap 专属页头
+  │    recentDeadTupleMinCsn  死亡元组最小CSN（用于Prune）│
+  │    fsmIndex               本页在FSM中的索引          │
+  │    potentialDelSize       可回收空间大小              │
+  ├────────────────────────────────────────────────────┤
+  │  TD 数组（Transaction Descriptor 槽位）              │  ← 事务描述符，向高地址增长
+  │    TD[0] TD[1] ... TD[N]                           │
+  ├────────────────────────────────────────────────────┤
+  │  ItemId 数组（元组指针/偏移）                         │  ← 向高地址增长
+  │    ItemId[0] ItemId[1] ...                         │
+  ├────────────────────────────────────────────────────┤
+  │  ← 空闲空间 →  （lower ~ upper 之间）                │
+  ├────────────────────────────────────────────────────┤
+  │  Tuple 数据区                                       │  ← 从 upper 向低地址增长
+  │  ... HeapDiskTuple[M] ... HeapDiskTuple[1]         │
+  └────────────────────────────────────────────────────┘
+
+  空间计算：
+  MaxDefaultTupleSpace = BLCKSZ - HEAP_PAGE_DATA_OFFSET
+                         - DEFAULT_TD_COUNT × sizeof(TD)
+                         - sizeof(ItemId)
+
+  MaxTupNumPerPage = (BLCKSZ - HEAP_PAGE_DATA_OFFSET - TdCount × sizeof(TD))
+                    / (HEAP_DISK_TUP_HEADER_SIZE + sizeof(ItemId) + 1)
+
+  ---
+  二、核心数据结构
+
+  2.1 HeapDiskTuple（元组头）
+
+  ┌─────────┬────────────┬──────────────────┬─────┬──────────┐
+  │ tdId(8b)│lockerTdId  │  info(32b)        │xid  │ data...  │
+  │         │    (8b)    │[flags|liveMode    │     │          │
+  │         │            │ |tdStatus|size]   │     │          │
+  └─────────┴────────────┴──────────────────┴─────┴──────────┘
+
+  ┌────────────┬────────────────────────────────────────────────┐
+  │    字段    │                      含义                      │
+  ├────────────┼────────────────────────────────────────────────┤
+  │ tdId       │ 关联的 TD 槽位 ID                              │
+  ├────────────┼────────────────────────────────────────────────┤
+  │ lockerTdId │ 当前锁持有者的 TD ID（SELECT FOR UPDATE）      │
+  ├────────────┼────────────────────────────────────────────────┤
+  │ info       │ 编码了 liveMode / tdStatus / 元组大小 / 标志位 │
+  ├────────────┼────────────────────────────────────────────────┤
+  │ xid        │ 最后操作此元组的事务 XID                       │
+  ├────────────┼────────────────────────────────────────────────┤
+  │ data[]     │ 实际行数据                                     │
+  └────────────┴────────────────────────────────────────────────┘
+
+  2.2 TD（Transaction Descriptor）槽
+
+  每个 TD 槽记录"哪个事务以何种方式持有这条元组"：
+
+  struct TD {
+      Xid         xid;          // 事务ID
+      UndoRecPtr  undoRecPtr;   // Undo 记录指针（用于回滚）
+      CommandId   cid;          // 事务内命令序号
+      CommitSeqNo csn;          // 提交序号（用于 MVCC 可见性判断）
+      // locker 信息
+  };
+
+  TD 状态（TupleTdStatus）：
+  - ATTACH_TD_AS_NEW_OWNER：元组当前被此 TD 的事务持有（写中/已写）
+  - ATTACH_TD_AS_HISTORY_OWNER：元组是历史版本
+  - DETACH_TD：元组已不再关联此 TD（已提交或已回滚并清理）
+
+  2.3 ItemId（元组指针）
+
+  struct ItemId {
+      uint16 offset;   // 元组在页内偏移
+      uint16 length;   // 元组长度
+      uint8  state;    // ITEM_ID_UNUSED / ITEM_ID_NORMAL / ITEM_ID_NO_STORAGE
+  };
+
+  - ITEM_ID_NORMAL：正常
+  - ITEM_ID_NO_STORAGE：元组数据已被 Prune 回收，但 ItemId 保留（防止索引悬挂）
+  - ITEM_ID_UNUSED：完全释放，可被新元组复用
+
+  ---
+  三、INSERT 流程
+
+  HeapInsertHandler::Insert(tuple)
+  │
+  ├─ PrepareTuple()                   设置初始字段：tdId=INVALID, liveMode=NORMAL_INSERT
+  │
+  ├─ AllocTransactionSlot()           在事务管理器分配事务槽（XID）
+  │
+  ├─ [大元组?] SplitTupIntoChunks()   切分为多个 Chunk，每个 Chunk 带 NextChunkCtid 链接
+  │
+  └─ InsertSmallDiskTup()
+     │
+     ├─ GetBuffer()                   从 FSM 找到有空闲空间的页
+     │   ├─ GetPageFromFSM(size)      先查空闲空间图
+     │   └─ GetNewPage()              FSM 无结果时扩展新页
+     │
+     ├─ AllocTd(tdcontext)            在页内分配 TD 槽
+     │   └─ [TD不足?] 触发 AllocTdWal 扩展 TD 数组
+     │
+     ├─ CheckPageHasEnoughSpace()     检查空间
+     │   └─ [不足?] TryPrunePage()    先尝试回收死元组腾出空间
+     │
+     ├─ 写入元组头
+     │   diskTup->SetTdId(tdId)
+     │   diskTup->SetXid(xid)
+     │   diskTup->SetTdStatus(ATTACH_TD_AS_NEW_OWNER)
+     │   diskTup->SetLiveMode(TUPLE_BY_NORMAL_INSERT)
+     │
+     ├─ page->AddTuple(diskTup)       追加到页面数据区，更新 ItemId、lower/upper
+     │
+     ├─ InsertUndoAndCheck()          写 Undo 记录（UNDO_HEAP_INSERT，含 ctid）
+     │
+     ├─ page->SetTd(tdId, xid, undoRecPtr, cid)  填充 TD 槽
+     │
+     ├─ GenerateHeapInsertWal()       生成 WAL 记录（含 offset、undoRecPtr、原始数据）
+     │
+     └─ UpdateFSM(page, freeSpace)    更新空闲空间图
+
+  ---
+  四、DELETE 流程
+
+  HeapDeleteHandler::Delete(ctid)
+  │
+  ├─ GetBuffer(ctid.pageId)           锁定页面
+  │
+  ├─ CheckTupleChanged()              检查元组是否被并发修改（见第七节）
+  │
+  ├─ IsDiskTupleDeleted(offset)?      已删则返回
+  │
+  ├─ AllocTd()                        分配新 TD 槽
+  │   └─ [不够?] TryPrunePage() 腾空间
+  │
+  ├─ page->CopyTuple(offset)          复制旧元组（留给 Undo）
+  │
+  ├─ diskTuple->SetLockerTdId(INVALID)  清除 Locker
+  │
+  ├─ 构建 UndoDataHeapDelete           包含完整旧元组数据（用于回滚还原）
+  │
+  ├─ InsertUndoAndCheck()             写 Undo 记录
+  │
+  ├─ page->SetTd(tdId, xid, undoRecPtr, cid)
+  │
+  ├─ page->DelTuple(offset)           把 ItemId 标记为 ITEM_ID_NO_STORAGE
+  │
+  ├─ page->AddPotentialDelItemSize()  累加 potentialDelSize
+  │
+  ├─ page->SetTuplePrunable(true)     标记页面有可回收元组
+  │
+  └─ GenerateHeapDeleteWal()          生成 WAL 记录
+
+  ---
+  五、UPDATE 流程
+
+  UPDATE 有三种策略，根据新旧元组大小和页面空间自动选择：
+
+  5.1 In-Place Update（就地更新，新≤旧大小）
+
+  旧元组位置直接修改数据
+  Undo 只存差异（diffPos + diffData），不存全量
+
+  UndoDataHeapInplaceUpdate {
+      oldTdId, numDiffPos, oldInfo, oldXid
+      rawData[] = [(start,end), oldBytes, ...]  // 每个改变区间的旧数据
+  }
+
+  liveMode → NEW_TUPLE_BY_INPLACE_UPDATE
+
+  5.2 Same-Page Append Update（同页追加，有空间）
+
+  旧元组：liveMode = OLD_TUPLE_BY_SAME_PAGE_UPDATE
+  新元组：liveMode = NEW_TUPLE_BY_SAME_PAGE_UPDATE（追加到同一页）
+  两者共享同一 TD 槽
+
+  Undo 存旧元组全量数据
+
+  5.3 Another-Page Append Update（跨页追加，无空间）
+
+  旧元组：liveMode = OLD_TUPLE_BY_ANOTHER_PAGE_UPDATE
+           oldTuple->SetNextCtid(newCtid)  ← 指向新元组位置
+  新元组：liveMode = NEW_TUPLE_BY_ANOTHER_PAGE_UPDATE（在另一页）
+
+  Undo 存 newCtid + 旧元组全量数据
+  扫描时通过 NextCtid 跟踪最新版本
+
+  三种策略对比：
+
+  ┌──────────────┬────────────┬────────────────┬───────────────┐
+  │     策略     │  触发条件  │    空间效率    │   回滚代价    │
+  ├──────────────┼────────────┼────────────────┼───────────────┤
+  │ In-Place     │ 新≤旧大小  │ 最高（无碎片） │ 低（仅 diff） │
+  ├──────────────┼────────────┼────────────────┼───────────────┤
+  │ Same-Page    │ 同页有空间 │ 中（同页两份） │ 中（全量旧）  │
+  ├──────────────┼────────────┼────────────────┼───────────────┤
+  │ Another-Page │ 同页无空间 │ 低（跨页两份） │ 高（跨页）    │
+  └──────────────┴────────────┴────────────────┴───────────────┘
+
+  ---
+  六、大元组（Big Tuple / Linked Chunk）
+
+  当元组超过页面最大空间（MaxPossibleTupleSpace）时：
+
+  SplitTupIntoChunks():
+
+  Chunk 1 (First)         Chunk 2                 Chunk 3 (Last)
+  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+  │ HeapDiskTuple   │    │ HeapDiskTuple   │    │ HeapDiskTuple   │
+  │  isLinked=true  │    │  isNotFirst=true│    │  isNotFirst=true│
+  │  numChunks=3    │    │                 │    │  isLast=true    │
+  │  NextChunkCtid ─┼──► │  NextChunkCtid ─┼──► │                 │
+  │  data[0..n]     │    │  data[n..m]     │    │  data[m..end]   │
+  └─────────────────┘    └─────────────────┘    └─────────────────┘
+
+  - 每个 Chunk 单独插入，有各自的 ItemId 和 ctid
+  - 扫描时 FetchBigTuple() 沿链拼装完整数据
+  - 删除/更新时逐个处理每个 Chunk
+
+  ---
+  七、MVCC 可见性（CheckTupleChanged / 快照判断）
+
+  每次读取或修改元组前，都需判断元组对当前事务的可见性：
+
+  CheckTupleVisible(tuple, snapshot):
+  │
+  ├─ 1. WaitTupleIfNeed()             如有 Locker，等待其完成
+  │     ├─ lockerXid == curXid?       是则跳过
+  │     ├─ lockerXid in-progress?     等待（WaitTxn）后重新检查
+  │     └─ lockerXid committed/abort  清除 locker 标记，继续
+  │
+  ├─ 2. 读取 tdId → TD 槽
+  │     ├─ DETACH_TD?                 元组已稳定，检查 CSN
+  │     ├─ xid == curXid?             同一事务，按 CID 判断
+  │     └─ ATTACH_TD_AS_NEW_OWNER     另一事务持有
+  │
+  ├─ 3. IsFrozen(xid)?                被 VACUUM freeze 过，对所有人可见
+  │
+  └─ 4. JudgeTupCommitBeforeSpecCsn() 比较 TD.csn 与 snapshot.csn
+         TD.csn < snapshot.csn → 可见（已在快照前提交）
+         TD.csn >= snapshot.csn → 不可见（快照后提交 or 未提交）
+
+  同事务内按 CID 判断：
+  CheckTupleChangedByCid():
+    FetchUndoRecordByMatchedCtidInCurXact()  // 从 Undo 链找到对应命令
+    CidVisibleToSnapshot(snapshot, cid)      // cid < snapshot.cid → 可见
+
+  ---
+  八、Prune（页面死元组回收）
+
+  Prune 是页内回收机制（非全表 VACUUM），在写入时空间不足时触发：
+
+  TryPrunePage(needSize):
+  │
+  ├─ CheckPagePrunable():           判断是否需要 Prune
+  │   ├─ potentialDelSize > maxSpace × 60%  → 需要
+  │   ├─ freeSpace < maxSpace × 20%        → 需要
+  │   └─ needSize < potentialDelSize       → 需要
+  │
+  ├─ ScanPrunableItems():           扫描可回收的元组
+  │   ├─ DETACH_TD 元组             → ItemId 标为 ITEM_ID_UNUSED（完全释放）
+  │   ├─ 已删除且 CSN < recycleMinCsn → 标为可 Prune
+  │   └─ 跳过：未提交、仍在用的元组
+  │
+  ├─ TryPruneItems():               执行 ItemId 状态更改
+  │   └─ page->PruneItems(diffs)    批量修改 ItemId
+  │
+  ├─ TryCompactTuples():            碎片整理
+  │   └─ 将分散的 Tuple 数据压实到 upper 端
+  │
+  └─ GeneratePruneWal():            记录 WAL
+      WalRecordHeapPrune {
+          recentDeadMinCsn,         // 更新页头 CSN 水位
+          diffNum,
+          rawData[] = ItemIdDiff[]  // 哪些 ItemId 变了
+      }
+
+  Prune 判断的 CSN 水位：
+  - recentDeadTupleMinCsn：页内死亡元组的最小提交 CSN
+  - recycleMinCsn：全局最老活跃快照的 CSN
+  - 只有 recentDeadTupleMinCsn < recycleMinCsn 才说明没有任何事务还需要看这些死元组
+
+  ---
+  九、FSM（空闲空间图）
+
+  FSM 维护每个页面的可用空间，加速 INSERT 时的页面定位：
+
+  INSERT 写入路径：
+    GetPageFromFSM(needSize)     → 查找有足够空间的页
+    GetNewPage()                 → 无结果则扩展新页
+
+  INSERT 完成后：
+    UpdateFSM(fsmIndex, freeSpace)   更新 FSM
+
+  DELETE 完成后：
+    UpdateFSM(fsmIndex, freeSpace + deletedSize)  增加可用空间
+
+  Prune 完成后：
+    UpdateFsmForPrune(offset)    释放空间反映到 FSM
+
+  填充因子（fill factor）：
+  - GetSaveFreeSpace() 保留一定比例空间不参与 FSM 分配（为 UPDATE 留原地空间）
+  - 默认预留约 20%，使 in-place update 成功率更高
+
+  ---
+  十、顺序扫描（SeqScan）流程
+
+  HeapScanHandler::SeqScan(snapshot):
+  │
+  ├─ DataSegmentScanContext::GetNextPageId()   逐页扫描段文件
+  │
+  ├─ BufMgr::ConsistentRead(crContext)        获取一致性读页面（CR Page）
+  │   └─ [需要 MVCC?] 应用 Undo 构建历史版本
+  │
+  └─ for each offset in ItemId[]:
+      ├─ 跳过 ITEM_ID_UNUSED / ITEM_ID_NO_STORAGE
+      ├─ GetTuple(offset)                     取出元组
+      ├─ liveMode == TUPLE_BY_NORMAL_DELETE?  跳过（已删除）
+      ├─ liveMode == OLD_TUPLE_BY_ANOTHER_PAGE_UPDATE? 跳过（旧版本）
+      ├─ IsLinked && IsFirstChunk?            FetchBigTuple() 组装大元组
+      ├─ CheckTupleVisible(snapshot)          MVCC 可见性检查
+      └─ ExecMatchScanKey()                   条件过滤后返回
+
+  ---
+  十一、WAL 与 Undo 配合关系
+
+                    CRASH RECOVERY                      ROLLBACK
+                         ↓                                  ↓
+      ┌─────────┐   ┌──────────┐                    ┌──────────────┐
+      │  WAL    │──►│ Redo Mgr │                    │  Undo Chain  │
+      │(物理重放)│   │ 重放页面  │                    │  回滚事务    │
+      └─────────┘   └──────────┘                    └──────────────┘
+
+  WAL 记录包含：
+    INSERT WAL  → offset + undoRecPtr + 完整 tuple 数据
+    DELETE WAL  → tdId + offset + undoRecPtr
+    UPDATE WAL  → offset + undoRecPtr + diff (inplace) or 新 tuple (append)
+    PRUNE WAL   → recentDeadMinCsn + ItemIdDiff[]
+    ALLOC_TD WAL → TD 数组扩展记录
+
+  Undo 记录包含：
+    INSERT Undo → ctid（回滚时删除此元组）
+    DELETE Undo → 完整旧元组（回滚时重新插入）
+    Inplace Undo→ (start,end,oldBytes)[] + oldInfo（回滚时恢复 diff）
+    Append Undo → 完整旧元组 + (跨页时) newCtid（回滚时删除新版本）
+
+  ---
+  十二、完整架构总览
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    HeapHandler（入口）                        │
+  │  Insert / Delete / Update / Scan / Lock / Prune             │
+  └──────────┬──────────────┬───────────────┬───────────────────┘
+             │              │               │
+      ┌──────▼──────┐ ┌─────▼─────┐ ┌──────▼──────┐
+      │  HeapPage   │ │ UndoMgr   │ │  WalMgr     │
+      │  TD Array   │ │ Undo Zone │ │  WAL Buffer │
+      │  ItemId []  │ │ Undo Ring │ │  Group Commit│
+      │  Tuple Data │ └───────────┘ └─────────────┘
+      └──────┬──────┘
+             │
+      ┌──────▼──────┐
+      │  BufMgr     │
+      │  LRU 缓冲池  │
+      │  CR Page    │  ← MVCC 一致性读副本
+      └──────┬──────┘
+             │
+      ┌──────▼──────┐
+      │  FSM        │  ← 空闲空间图（加速 INSERT 页面分配）
+      └──────┬──────┘
+             │
+      ┌──────▼──────┐
+      │  Tablespace │
+      │  Segment    │  ← 物理文件/Extent 管理
+      └─────────────┘
+
+  ---
+  核心设计总结：
+
+  ┌───────────────┬─────────────────────────────────────────┐
+  │     机制      │                  作用                   │
+  ├───────────────┼─────────────────────────────────────────┤
+  │ TD 槽（页内） │ 事务与元组关联，无需全局事务表查询      │
+  ├───────────────┼─────────────────────────────────────────┤
+  │ liveMode 标记 │ 区分插入/删除/更新的不同版本状态        │
+  ├───────────────┼─────────────────────────────────────────┤
+  │ Undo 链       │ MVCC 历史版本构建 + 事务回滚            │
+  ├───────────────┼─────────────────────────────────────────┤
+  │ CSN 水位      │ 控制 Prune 安全边界，保证快照可见性     │
+  ├───────────────┼─────────────────────────────────────────┤
+  │ FSM           │ O(log n) 找到有空间的页面，避免全表扫描 │
+  ├───────────────┼─────────────────────────────────────────┤
+  │ CR Page       │ 读操作无锁构建一致性快照，不阻塞写      │
+  ├───────────────┼─────────────────────────────────────────┤
+  │ Prune（页内） │ 写入路径中即时回收，减少 VACUUM 压力    │
+  └───────────────┴─────────────────────────────────────────┘
