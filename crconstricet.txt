@@ -1,0 +1,220 @@
+ ---
+  CR Page（一致性读页面）构建原理
+
+  ---
+  一、什么是 CR Page
+
+  CR Page（Consistent Read Page）是 DStore MVCC 的核心机制。
+
+  核心问题：缓冲池里的 Base Page 是最新版本，但并发读事务可能持有一个更早的快照（CSN < 当前），看不到 Base Page 上部分事务的修改。
+
+  解决方案：在内存中创建一份 Base Page 的副本，把"快照之后才提交"的事务修改逆向应用 Undo，回退到快照能看到的历史版本 —— 这份副本就是 CR Page。
+
+  Base Page（最新）               CR Page（快照一致版本）
+  ┌─────────────────────┐         ┌─────────────────────┐
+  │ TD[0]: txn_A csn=50 │  复制   │ TD[0]: txn_A csn=50 │
+  │ TD[1]: txn_B csn=80 │ ──────► │ TD[1]: (回滚 txn_B) │ ← Undo 回退
+  │ TD[2]: txn_C csn=90 │         │ TD[2]: (回滚 txn_C) │ ← Undo 回退
+  │ 数据: 最新版本       │         │ 数据: snapshot_csn  │
+  └─────────────────────┘         │       =60 时的版本   │
+                                  └─────────────────────┘
+
+  ---
+  二、触发入口：ConsistentRead
+
+  读事务（SeqScan、IndexScan）通过 BufMgr::ConsistentRead() 获取一致性页面：
+
+  struct ConsistentReadContext {
+      // 输入
+      PdbId    pdbId;
+      PageId   pageId;
+      Xid      currentXid;   // 当前事务 XID
+      Snapshot snapshot;     // 快照（含 snapshotCsn、cid）
+      void    *dataPageExtraInfo;
+
+      // 输出
+      DataPage   *destPage;   // 若需本地构建，写入此处
+      BufferDesc *crBufDesc;  // 若命中缓存，返回缓存的 CR Buffer
+  };
+
+  ---
+  三、完整构建流程（五个步骤）
+
+  ConsistentReadInternal(crContext):
+  │
+  ├─ Step 1: Read(pageId, LW_SHARED)       读取 Base Page，加共享锁
+  │
+  ├─ Step 2: FindCrBuffer(base, snapshot)  查找缓存的 CR Buffer
+  │   └─ 命中？→ 直接返回，流程结束（快路径）
+  │
+  ├─ Step 3: memcpy(destPage, basePage)    把 Base Page 完整复制到本地
+  │           UnlockContent(baseBufDesc)   立刻释放 Base Page 内容锁
+  │                                        （不阻塞写入）
+  ├─ Step 4: destPage->ConstructCR(txn, crCtx)  在副本上构建 CR
+  │           │
+  │           ├─ 第一轮：扫描所有 TD 槽
+  │           │   对每个 TD，判断其 XID 状态：
+  │           │   ├─ Frozen（已冻结）         → 跳过
+  │           │   ├─ currentXid（当前事务）   → 按 CID 回滚本命令之后的改动
+  │           │   ├─ PendingCommit（提交中）  → 等待结束，若失败则回滚
+  │           │   ├─ InProgress（进行中）     → 直接回滚整条 TD 链
+  │           │   ├─ Aborted（已回滚）        → 回滚（数据可能未清理）
+  │           │   └─ Committed（已提交）
+  │           │       csn >= snapshot.csn → 加入 tdHeap（待回滚队列）
+  │           │       csn <  snapshot.csn → 记录 pageMaxCsn（此 TD 可见）
+  │           │
+  │           └─ 第二轮：处理 tdHeap（已提交但快照不可见的事务）
+  │               按 CSN 从大到小出堆，逐一调用 RollbackTdOneXidForCRAsNeed()
+  │               直到堆顶 csn < snapshot.csn 为止
+  │
+  └─ Step 5: 决定是否缓存 CR Buffer
+      useLocalCr == false？→ ReadOrAllocCr() → memcpy → FinishCrBuild()
+      useLocalCr == true？ → 只用本地副本，不缓存（快照唯一性 / 有当前事务改动）
+
+  ---
+  四、关键子函数：RollbackTdOneXidForCRAsNeed
+
+  这是真正"把数据回退到历史版本"的核心函数：
+
+  RollbackTdOneXidForCRAsNeed(pdbId, td, isCurrentXid, snapshot):
+  │
+  ├─ IsXidRecycled(xid)?          Undo 已被回收 → Reset TD，直接结束
+  │
+  └─ for(;;) 沿 Undo 链遍历：
+      │
+      ├─ FetchUndoRecord(td.undoRecPtr)   取出 Undo 记录
+      │
+      ├─ isCurrentXid && CidVisibleToSnapshot(cid)?
+      │   是 → 已到达快照可见点，停止回滚（break）
+      │
+      ├─ RollbackByUndoRec(&undoRecord)   将此 Undo 记录**逆向应用**到 CR Page
+      │   ├─ INSERT 的 Undo → 删除该元组（标 ItemId 无效）
+      │   ├─ DELETE 的 Undo → 恢复旧元组（把完整数据写回）
+      │   └─ UPDATE 的 Undo → 恢复 diff（把旧字节写回对应位置）
+      │
+      ├─ td.xid 变化？(沿链跳到前一个事务) → break
+      └─ 否则继续取下一条 Undo 记录
+
+  ---
+  五、第二轮回滚：tdHeap（按 CSN 降序的优先队列）
+
+  第一轮只处理了特殊状态的事务（未提交/进行中/回滚）。已提交但 CSN 超过快照的事务被放入一个二叉堆（binaryheap），按 CSN 从大到小排序，依次回滚：
+
+  RollbackTdsForCR(tdHeap, snapshot):
+
+    while (!heap_empty):
+      td = heap_top()                 取 CSN 最大的 TD
+      if td.csn < snapshot.csn:
+          pageMaxCsn = max(pageMaxCsn, td.csn)
+          break                       此 TD 可见，停止
+      RollbackTdOneXidForCRAsNeed()   逆向应用 Undo
+      更新 heap（td 的 xid 可能变成前一个事务，重新入堆排序）
+
+  这保证了：CSN 最大的（最新的）修改先被回滚，避免 Undo 链顺序混乱。
+
+  ---
+  六、CRInfo —— CR Buffer 与 Base Buffer 的绑定
+
+  每个 Base Buffer 的 BufferDesc 内嵌一个 CRInfo，记录它关联的 CR Buffer：
+
+  union CRInfo {
+      // Base Buffer 视角
+      struct {
+          BufferDesc *crBuffer;       // 关联的 CR Buffer 指针
+          CommitSeqNo crPageMaxCsn;   // CR Page 中最大可见 CSN
+          bool isUsable;              // CR Buffer 是否有效
+      };
+      // CR Buffer 视角（共用内存）
+      struct {
+          BufferDesc *crBaseBuffer;   // 反向指回 Base Buffer
+          ...
+      };
+  };
+
+  快照匹配判断 (IsCrMatched)：
+  bool IsCrMatched(CommitSeqNo snapshotCsn) const {
+      return snapshotCsn > crPageMaxCsn;
+      // CR Page 中最新的提交 CSN < 快照 CSN
+      // 说明 CR Page 的内容对此快照完全可见
+  }
+
+  ---
+  七、CR Buffer 的生命周期
+
+                      写操作触发（LW_EXCLUSIVE）
+                      Read(pageId, LW_EXCLUSIVE)
+                             │
+                      InvalidateCrPage()   ← 废弃旧 CR Buffer
+                             │
+          ┌──────────────────▼──────────────────┐
+          │           Base Buffer                │
+          │  crInfo: { crBuffer=null, invalid }  │
+          └──────────────────┬──────────────────┘
+                             │ 读事务触发 ConsistentRead
+                             │
+               ┌─────────────▼─────────────┐
+               │       FindCrBuffer()       │
+               │  IsCrUsable && IsCrMatched │
+               └──────┬────────────────────┘
+             命中     │          未命中
+              ▼       │           ▼
+        直接返回        │    ReadOrAllocCr()  从 LRU 找空闲 Buffer
+        crBufDesc       │         │
+                        │    AllocCrEntry()  设置 BUF_CR_PAGE 标志
+                        │         │
+                        │    memcpy(destPage) + ConstructCR()
+                        │         │
+                        │    FinishCrBuild(pageMaxCsn)
+                        │         │
+                        │    baseBuffer.crInfo.isUsable = true
+                        │    crBuffer.BUF_VALID = true
+                        │
+                        └──────► 下次读命中缓存
+
+  ---
+  八、useLocalCr：什么时候不缓存
+
+  ConstructCR 完成后，通过 crCtx.useLocalCr 标志决定是否把 CR Page 放入共享 CR Buffer：
+
+  ┌──────────────────────┬────────────┬──────────────────────────────────────────┐
+  │         情况         │ useLocalCr │                   原因                   │
+  ├──────────────────────┼────────────┼──────────────────────────────────────────┤
+  │ 当前事务修改了此页   │ true       │ 快照含 CID，每个事务的视角不同，无法共享 │
+  ├──────────────────────┼────────────┼──────────────────────────────────────────┤
+  │ 进行中事务被回滚     │ true       │ 回滚内容可能与其他读不同                 │
+  ├──────────────────────┼────────────┼──────────────────────────────────────────┤
+  │ 页面有 CrExtend 标记 │ true       │ 页面扩展过，不稳定                       │
+  ├──────────────────────┼────────────┼──────────────────────────────────────────┤
+  │ snapshot.csn == MAX  │ true       │ SNAPSHOT_NOW 类型，不缓存                │
+  ├──────────────────────┼────────────┼──────────────────────────────────────────┤
+  │ 仅已提交事务回滚     │ false      │ 所有事务看到的历史版本相同，可共享缓存   │
+  └──────────────────────┴────────────┴──────────────────────────────────────────┘
+
+  ---
+  九、整体设计小结
+
+  读事务快照 (csn=60)
+          │
+          ▼
+  ┌───────────────────────────────────────────────┐
+  │  Base Page (最新，含 csn=50/80/90 的修改)      │
+  │                                               │
+  │  1. memcpy → CR Page 副本                     │
+  │  2. 扫描 TD 槽，分类处理每个事务              │
+  │  3. csn>60 的事务 → 沿 Undo 链逐条回退        │
+  │     ┌──────────────────────────────┐          │
+  │     │ Undo[csn=90]: DELETE undo    │          │
+  │     │ Undo[csn=80]: UPDATE undo    │ 逆向应用 │
+  │     └──────────────────────────────┘          │
+  │  4. 结果：CR Page 只含 csn≤60 的数据          │
+  └───────────────────────────────────────────────┘
+          │
+          ▼
+   读事务看到的一致性快照视图（无锁，不阻塞写入）
+
+  关键设计优势：
+  - 读不阻塞写：memcpy 后立刻释放 Base Page 锁，ConstructCR 在副本上独立完成
+  - 写不阻塞读：写操作只需废弃旧 CR Buffer，不等待读事务
+  - CR Buffer 可复用：相同基础页、相同可见范围的快照共享一个 CR Buffer，减少重复构建
+  - 精确的 CSN 水位：pageMaxCsn 记录 CR Page 的最新提交 CSN，判断是否命中只需一次比较
+
