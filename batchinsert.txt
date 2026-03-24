@@ -1,0 +1,146 @@
+  ---
+  Batch Insert 代码审查报告
+
+  一、缺陷（Defects）
+
+  ---
+  1. LOB 字段未处理（功能缺失）
+
+  单条 Insert 接口（dstore_heap_interface.cpp:76）有 LOB 预处理：
+  if (unlikely(tupDesc != nullptr && tupDesc->tdhaslob && lobTableSmgr != nullptr)) {
+      HeapLobHandler lobHandler(relation);
+      lobHandler.Insert(tuple, cid);  // LOB 先入 LOB 表
+  }
+
+  而 BatchInsert 接口（dstore_heap_interface.cpp:128）完全跳过了这段逻辑：
+  for (uint16_t i = 0; i < nTuples; i++) {
+      contexts[i].heapTuple = tuples[i];   // 直接使用，无 LOB 处理
+      contexts[i].ctid = INVALID_ITEM_POINTER;
+      contexts[i].cid = cid;
+  }
+
+  后果：对含 LOB 列的表调用 BatchInsert，LOB 数据会被丢失或写入错误位置。
+
+  ---
+  2. totalSmallDiskSize 跨页迭代不更新（逻辑错误）
+
+  BatchInsertSmallTuples（第 635 行）的主循环：
+  while (ndone < ntuples) {
+      uint32 pageSize = DstoreMin(totalSmallDiskSize, tupleSpace);
+      m_bufferDesc = GetBuffer(tdId, pageSize);  // pageSize 始终是总量
+      ...
+      ndone += nthispage;
+      // totalSmallDiskSize 从未减去已写入的量
+  }
+
+  第一页写完后，totalSmallDiskSize 仍是所有小元组的总大小。后续页向 FSM 请求的 pageSize 被夸大，FSM 可能跳过实际够用的半满页，导致：
+  - 不必要地扩展新页
+  - FSM 利用率下降
+
+  修复方向：每次 ndone += nthispage 时同步减去已写入的字节数。
+
+  ---
+  3. 大元组批量插入无任何优化（名实不符）
+
+  BatchInsert（第 546 行）对大元组走的是：
+  if (HeapPage::TupBiggerThanPage(heapTuple)) {
+      BatchInsertBigTuple(context);  // 实际上每个 chunk 单独调用 InsertSmallDiskTup
+      ...
+  }
+
+  BatchInsertBigTuple 的实现（第 580 行）与普通 InsertBigTuple 完全相同：
+  for (int32 i = m_tupChunks.m_chunkNum - 1; i >= 0; --i) {
+      InsertSmallDiskTup(insertContext, tupChunk, diskTupSize);  // 每个 chunk 独立 Undo + WAL
+  }
+
+  批量调用 N 个大元组和循环调用 N 次单条 Insert 没有任何区别，Undo 和 WAL 均未合并。
+
+  ---
+  4. 结构体命名拼写错误
+
+  // interface/heap/dstore_heap_struct.h:115
+  struct HeapBacthInsertContext {   // "Bacth" 应为 "Batch"
+
+  接口函数签名中也同样：
+  RetStatus BatchInsert(HeapBacthInsertContext *batchContext);
+
+  ---
+  二、优化点
+
+  ---
+  5. 接口层每次调用都分配中间数组
+
+  dstore_heap_interface.cpp 每次 BatchInsert 都做：
+  HeapInsertContext *contexts =
+      static_cast<HeapInsertContext *>(DstorePalloc(sizeof(HeapInsertContext) * nTuples));
+  for (uint16_t i = 0; i < nTuples; i++) {
+      contexts[i].heapTuple = tuples[i];
+      contexts[i].ctid = INVALID_ITEM_POINTER;
+      contexts[i].cid = cid;   // 所有 tuple 的 cid 相同
+  }
+
+  HeapBacthInsertContext 内部直接保存 HeapTuple** 指针数组即可，无需新建 HeapInsertContext 数组，省去 O(N) 的初始化分配。
+
+  ---
+  6. smallTupleContexts 按总量分配，浪费内存
+
+  // BatchInsert 第 528 行
+  HeapInsertContext **smallTupleContexts =
+      static_cast<HeapInsertContext **>(DstorePalloc(sizeof(HeapInsertContext *) * batchContext->count));
+
+  按 batchContext->count（总元组数）分配，但实际只存小元组指针。如果批次中大元组占多数，这里浪费明显。应在统计出 nsmalltuples
+  之后再按实际数量分配，或改用栈上小数组 + 动态扩容。
+
+  ---
+  7. LocateUsableItemIds 每次从 offset=1 线性扫描
+
+  // 第 861 行
+  for (offsetNumber = 1; offsetNumber < limit; offsetNumber++) {
+      ItemId *itemId = page->GetItemIdPtr(offsetNumber);
+      if (itemId->IsUnused()) { ... }
+  }
+
+  每次调用都从头扫描，对已有大量 ItemId 的页面复杂度为 O(已有元组数)。可以在 HeapPage 中维护一个 unused ItemId 的 hint
+  位图或起始偏移，将此步骤降到 O(1)～O(unused数量)。
+
+  ---
+  8. 批次数量上限被 uint16_t 硬限制
+
+  struct HeapBacthInsertContext {
+      HeapInsertContext *contexts;
+      uint16_t count;   // 最大 65535
+  };
+
+  接口参数也是 uint16_t nTuples。对于大规模导入场景（如 COPY 命令），调用方需要自行切片，无法传入更大的批次。count 改为 uint32_t 更合适。
+
+  ---
+  9. GetBuffer 每次请求整页空间，不随剩余量下降
+
+  对应缺陷 2 的延伸：即使剩余只有 3 条小元组，GetBuffer 仍以 tupleSpace（整页容量）为目标请求空间，FSM
+  会优先返回空闲空间大的页，而跳过只差几百字节就够用的半满页，加剧页面碎片。
+
+  ---
+  三、汇总
+
+  ┌──────┬──────┬───────────────────────────────┬──────────────────────────────────────────────────┐
+  │ 编号 │ 类型 │             位置              │                       描述                       │
+  ├──────┼──────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 1    │ 缺陷 │ dstore_heap_interface.cpp:128 │ LOB 字段在 BatchInsert 中完全未处理              │
+  ├──────┼──────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 2    │ 缺陷 │ dstore_heap_insert.cpp:650    │ totalSmallDiskSize 跨页不更新，FSM 请求空间虚高  │
+  ├──────┼──────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 3    │ 缺陷 │ dstore_heap_insert.cpp:580    │ 大元组批量插入与逐条插入无区别，无 Undo/WAL 合并 │
+  ├──────┼──────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 4    │ 缺陷 │ dstore_heap_struct.h:115      │ 结构体名拼写错误 HeapBacthInsertContext          │
+  ├──────┼──────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 5    │ 优化 │ dstore_heap_interface.cpp:122 │ 接口层每次分配中间数组，可改为直接传指针         │
+  ├──────┼──────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 6    │ 优化 │ dstore_heap_insert.cpp:528    │ smallTupleContexts 按总量分配，应按实际小元组数  │
+  ├──────┼──────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 7    │ 优化 │ dstore_heap_insert.cpp:861    │ LocateUsableItemIds 线性扫描，可加 hint 优化     │
+  ├──────┼──────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 8    │ 优化 │ dstore_heap_struct.h:117      │ count 用 uint16_t 限制最大 65535 条              │
+  ├──────┼──────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 9    │ 优化 │ dstore_heap_insert.cpp:650    │ GetBuffer 请求空间不随剩余量收敛，影响 FSM 效率  │
+  └──────┴──────┴───────────────────────────────┴──────────────────────────────────────────────────┘
+
