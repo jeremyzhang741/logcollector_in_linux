@@ -1,0 +1,190 @@
+  ---
+  整体架构
+
+  dstore 采用 MVCC + Undo Log 的事务实现，核心组件：
+
+  ┌─────────────────────────────┬────────────────────────────────────────────┬──────────────────────┐
+  │            组件             │                    文件                    │         职责         │
+  ├─────────────────────────────┼────────────────────────────────────────────┼──────────────────────┤
+  │ Transaction                 │ src/transaction/dstore_transaction.cpp     │ 事务生命周期主控     │
+  ├─────────────────────────────┼────────────────────────────────────────────┼──────────────────────┤
+  │ TransactionMgr              │ src/transaction/dstore_transaction_mgr.cpp │ XID 分配、槽位管理   │
+  ├─────────────────────────────┼────────────────────────────────────────────┼──────────────────────┤
+  │ CsnMgr                      │ src/transaction/dstore_csn_mgr.cpp         │ CSN 原子生成与持久化 │
+  ├─────────────────────────────┼────────────────────────────────────────────┼──────────────────────┤
+  │ TD (Transaction Descriptor) │ include/page/dstore_td.h                   │ 页内事务元数据       │
+  ├─────────────────────────────┼────────────────────────────────────────────┼──────────────────────┤
+  │ UndoZone                    │ include/undo/dstore_undo_zone.h            │ Undo 段管理与回滚    │
+  └─────────────────────────────┴────────────────────────────────────────────┴──────────────────────┘
+
+  ---
+  1. XID 结构
+
+  // include/transaction/dstore_transaction_types.h:51
+  union Xid {
+      uint64 m_placeHolder;
+      struct {
+          uint64 m_zoneId     : 20;   // Undo Zone 编号
+          uint64 m_logicSlotId: 44;   // Zone 内逻辑槽位编号
+      };
+  };
+
+  XID 直接编码了所在 Undo Zone，读取事务状态时无需全局查找。
+
+  ---
+  2. 事务启动
+
+  Transaction::StartInternal() (dstore_transaction.cpp:246)：
+  1. InitInfoForNewTrx() — 状态 → TRANS_INPROGRESS，CSN = INVALID，CID = FIRST_CID(0)
+  2. 触发 TRX_EVENT_START 回调
+  3. 此时 XID 尚未分配，延迟到第一次写操作时 AllocTransactionSlot()
+
+  TransactionMgr::AllocTransactionSlot()：
+  - 从对应 UndoZone::AllocSlot() 拿到 XID
+  - 通过 XactLockMgr::Lock(pdbId, xid) 注册事务锁
+
+  ---
+  3. 提交流程
+
+  Transaction::CommitInternal() (dstore_transaction.cpp:287)：
+
+  PreCommit  (TRX_EVENT_PRE_COMMIT)
+      ↓
+  RecordCommit
+      ├── 只读事务 → 跳过 WAL
+      └── 写事务 → TransactionMgr::CommitTransactionSlot()
+              ├── CsnMgr::GetNextCsn(csn, true)  // 原子自增
+              ├── 事务槽状态 → TXN_STATUS_COMMITTED
+              └── 写 Commit WAL（含 CSN + WAL ID + commit end PLSN）
+      ↓
+  PostCommit (TRX_EVENT_POST_COMMIT)
+      ↓
+  Cleanup    (释放锁、Undo 指针、内存上下文)
+
+  ---
+  4. 回滚流程
+
+  Transaction::AbortInternal() 采用可重入状态机（防止 abort 过程中再次出错丢失进度）：
+
+  // include/transaction/dstore_transaction_types.h:95
+  enum class TransAbortStage : uint8 {
+      AbortNotStart, PreAbortDone, RecordAbortDone,
+      PostAbortDone, CleanUpResourceDone,
+      DecreasePdbTransCountDone, DstoreAbortCompleted
+  };
+
+  核心步骤 RecordAbort()：
+  - 调用 TransactionMgr::RollbackTransactionSlot(xid)
+  - → UndoZone::RollbackUndoZone(xid, isRecovery=false)（异步回滚）
+  - 逆序遍历 Undo 记录，重放每条记录恢复旧版本数据
+
+  ---
+  5. CSN 管理（MVCC 核心）
+
+  // include/transaction/dstore_csn_mgr.h
+  class CsnMgr {
+      alignas(64) atomic<uint64> m_nextCsn;
+      alignas(64) atomic<uint64> m_maxReservedCsn;  // 崩溃恢复用
+      uint64 m_csnAssignmentIncrement;               // 批量持久化粒度
+  };
+
+  - 每次提交 fetch_and_add(m_nextCsn) 原子获取 CSN
+  - 每 m_csnAssignmentIncrement 次提交才更新一次控制文件（降低 I/O）
+  - 崩溃重启后从控制文件读取 maxReservedCsn 恢复
+
+  ---
+  6. 快照与可见性
+
+  Snapshot 类型 (interface/transaction/dstore_transaction_struct.h:104)：
+
+  ┌────────────────┬─────────────────────────────────┐
+  │      类型      │            可见范围             │
+  ├────────────────┼─────────────────────────────────┤
+  │ SNAPSHOT_MVCC  │ CSN < snapshot.csn 的已提交事务 │
+  ├────────────────┼─────────────────────────────────┤
+  │ SNAPSHOT_NOW   │ 所有当前已提交事务              │
+  ├────────────────┼─────────────────────────────────┤
+  │ SNAPSHOT_DIRTY │ 已提交 + 进行中（排除已终止）   │
+  └────────────────┴─────────────────────────────────┘
+
+  可见性判断 (XidVisibleToSnapshot, dstore_transaction.cpp:1313)：
+
+  XID → 查 XidStatus
+    ├── Frozen    → 可见（老事务，可裁剪）
+    ├── Aborted   → 不可见
+    ├── Dirty Snapshot → 可见
+    ├── Committed → csn < snapshot.csn ? 可见 : 不可见
+    ├── PendingCommit → 等待事务结束后重判
+    └── InProgress → 不可见
+
+  对于 READ_COMMITTED 隔离级别，每条 SQL 语句开始时重新 SetSnapshotCsn()：
+
+  // dstore_transaction.cpp:1534
+  SetThrdLocalCsn(MAX_COMMITSEQNO)   // 加锁语义
+  → GetNextCsn(csn, false)           // 读当前 CSN（不递增）
+  → SetThrdLocalCsn(min(csn, cursorMin))
+  → m_snapshot.SetCsn(csn)
+
+  ---
+  7. TD（页内事务描述符）
+
+  每个数据页内嵌若干 TD 槽位，Tuple 头部指向对应 TD：
+
+  // include/page/dstore_td.h:164
+  struct TD {
+      uint64      m_xid;          // 事务 XID
+      CommitSeqNo m_csn;          // 提交 CSN（提交后填入）
+      uint64      m_undoRecPtr;   // 最新 Undo 记录指针
+      uint64      m_lockerXid;    // 行锁持有者
+      CommandId   m_commandId;    // 操作命令 ID
+      uint16      m_status : 2;   // TD 状态（未占用/进行中/已结束）
+      uint16      m_csnStatus: 2; // CSN 有效性状态
+  };
+
+  TD 减少了大量对全局事务表的查询，是性能优化的关键。
+
+  ---
+  8. Undo 记录结构
+
+  // include/undo/dstore_undo_record.h:93
+  struct UndoRecordHeader {
+      UndoType  m_undoType;        // 操作类型（INSERT/UPDATE/DELETE）
+      CommandId m_cid;             // 命令 ID
+      UndoTdInfo m_tdPreInfo;      // 操作前的 TD 快照（用于回滚还原 TD）
+      uint64    m_txnPreUndoPtr;   // 同一事务的上一条 Undo 记录（链表）
+      uint64    m_ctid;            // 被修改 Tuple 的 CTID
+      uint64    m_fileVersion;     // 文件版本校验
+  };
+
+  事务内的 Undo 记录形成单向链表（通过 m_txnPreUndoPtr），回滚时逆序遍历。
+
+  ---
+  9. Savepoint
+
+  include/transaction/dstore_savepoint.h：
+  - 每个 Savepoint 保存 Undo 链尾指针 和 锁资源位置
+  - 回滚到 Savepoint = 从当前 Undo 链尾回放到 Savepoint 记录的位置
+
+  ---
+  核心流程总结图
+
+  BEGIN
+    └─ Transaction::StartInternal()
+         └─ 状态=INPROGRESS, XID/CSN 延迟分配
+
+  DML (INSERT/UPDATE/DELETE)
+    ├─ 首次写 → AllocTransactionSlot() 分配 XID
+    ├─ 在页面上占用/更新 TD（写入 XID + UndoPtr）
+    ├─ 写 Undo Record（含操作前数据）
+    └─ 写 WAL（数据页 WAL）
+
+  COMMIT
+    ├─ CsnMgr::GetNextCsn() 原子获取 CSN
+    ├─ 事务槽 → COMMITTED，填入 CSN
+    ├─ 写 Commit WAL
+    └─ TD 中 CSN 后续由 Vacuum/访问时填入
+
+  ROLLBACK
+    ├─ 事务槽 → ABORTED
+    └─ 异步：逆序回放 Undo 链，恢复旧版本数据
+
