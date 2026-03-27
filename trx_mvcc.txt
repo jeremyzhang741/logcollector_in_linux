@@ -340,3 +340,222 @@
 
   本质：这是一种惰性清理设计。tuple 提交时不立即更新 tdStatus，而是推迟到有新写入需要回收 TD 槽时才做批量更新。代价是每次回收 TD
   时需要扫描页上所有 tuple，收益是避免了提交路径上的额外页面写入。
+
+
+
+
+❯ ATTACH_TD_AS_HISTORY_OWNER状态td被复用单不更新csn，那新事务怎么提交
+
+  Searched for 8 patterns, read 4 files (ctrl+o to expand)
+
+⏺ 这是整个 MVCC 设计中最精妙的部分。现在有了完整的证据链，可以准确回答这个问题。
+
+  关键：SetTd() 是入口
+
+  当新事务 T2 占用被复用的 TD 槽时，调用 SetTd()（include/page/dstore_data_page.h:158）：
+
+  inline void SetTd(uint8 tdId, Xid xid, UndoRecPtr undoPtr, CommandId commandId)
+  {
+      TD *td = GetTd(tdId);
+
+      if (td->GetXid() != INVALID_XID && td->GetXid() != xid) {
+          if (td->TestCsnStatus(IS_CUR_XID_CSN)) {
+              td->SetCsnStatus(IS_PREV_XID_CSN);  // ← T1的CSN降级为"历史CSN"
+          } else if (td->TestCsnStatus(IS_PREV_XID_CSN)) {
+              // 已经是历史CSN了，保持不变
+          }
+      }
+
+      td->SetXid(xid);            // 覆写为 T2 的 XID
+      td->SetUndoRecPtr(undoPtr); // 覆写为 T2 的 undo 指针
+      td->SetStatus(OCCUPY_TRX_IN_PROGRESS);
+  }
+
+  TD 此时的状态：
+
+  XID       = T2 (新事务)
+  CSN       = 100 (T1的，保留)
+  csnStatus = IS_PREV_XID_CSN  ← 这是关键标记
+  undoPtr   = T2的第一条undo记录
+  status    = IN_PROGRESS
+
+  ---
+  T2 提交时做什么
+
+  T2 提交时，CSN 写入undo zone 的 transaction slot，不写回页面 TD。
+
+  页面 TD 的 CSN 通过 FillCsn() 惰性更新：
+
+  // src/page/dstore_page.cpp:136
+  CommitSeqNo TD::FillCsn(Transaction *transaction, ...) {
+      if (TestCsnStatus(IS_CUR_XID_CSN)) return m_csn;  // 已有则跳过
+
+      // IS_PREV_XID_CSN 不命中上面的 early return，会继续执行：
+      if (inXidStatus->IsCommitted()) {
+          m_csn = inXidStatus->GetCsn();          // 覆写为 T2 的 CSN
+          m_csnStatus = IS_CUR_XID_CSN;
+      }
+  }
+
+  FillCsn() 在下次 TD 回收（TryReuseOneTdSlot）时才被调用，不在提交路径上。
+
+  ---
+  HISTORY_OWNER tuple 的可见性判断
+
+  GetVisibleTuple() 对 ATTACH_TD_AS_HISTORY_OWNER：
+
+  needUndo = td->TestCsnStatus(IS_INVALID) || !XidVisibleToSnapshot(snapshot, td->GetCsn())
+
+  FillCsn 调用前（TD 还是 IS_PREV_XID_CSN，CSN=100）：
+  - snapshot=150 → !XidVisible(150, 100) = false → 不需要 undo，直接返回 T1 的 tuple ✓
+
+  FillCsn 调用后（TD 已是 IS_CUR_XID_CSN，CSN=T2_csn=200）：
+  - snapshot=150 → !XidVisible(150, 200) = true → 进入 undo 重建
+
+  ---
+  Undo 链跨事务跳转（最关键的设计）
+
+  进入 ConstructCrTuple 时，crTd 里 XID=T2，undoPtr=T2的 undo 链头。但这条 CTID 可能是 T1 改的，T2 根本没碰过它。
+
+  FetchUndoRecordByMatchedCtid（src/transaction/dstore_transaction_mgr.cpp:825）：
+
+  while (true) {
+      FetchUndoRecord(undoRec, curPtr, curXid);
+
+      if (undoRec->IsMatchedCtid(ctid)) break;  // 找到了，退出
+
+      // 没找到：检查 undo 记录里记录的"上一个 TD 拥有者"
+      if (undoRec->GetTdPreXid() != curXid && undoRec->GetTdPreXid() != INVALID_XID) {
+          // TD 曾被前一个事务持有，跳转过去！
+          *matchedCsn = undoRec->GetTdPreCsn();  // 更新为 T1 的 CSN
+      }
+      curXid = undoRec->GetTdPreXid();       // 跳转到 T1 的 XID
+      curPtr = undoRec->GetTdPreUndoPtr();   // 跳转到 T1 的 undo 链
+  }
+  xid = curXid;  // 返回时把 xid 更新为匹配到的事务
+
+  每条 undo 记录里存储了写入时的 TD 前状态（UndoTdInfo m_tdPreInfo），其中包含 T1 的 XID 和 undo 指针。 当遍历 T2 的 undo 链找不到这个 CTID
+  时，通过 T2 第一条 undo 记录的 TdPreInfo 跳转到 T1 的 undo 链继续搜索。
+
+  ---
+  完整流程图
+
+  T1 修改 CTID_X，提交 CSN=100
+    TD: {XID=T1, CSN=100, csnStatus=IS_CUR_XID_CSN, undo=T1_undo}
+
+  T2 复用该 TD（SetTd）
+    TD: {XID=T2, CSN=100, csnStatus=IS_PREV_XID_CSN, undo=T2_undo}
+    T2的第一条undo记录: TdPreInfo={XID=T1, CSN=100, undo=T1_undo}
+
+  T2 提交 CSN=200
+    undo zone transaction slot 记录 T2→CSN=200
+    页面TD不变（惰性更新）
+
+  读取 CTID_X（snapshot=150），TD已被FillCsn更新为IS_CUR_XID_CSN/CSN=200：
+    needUndo = !XidVisible(150, 200) = true → 进入 ConstructCrTuple
+
+    FetchUndoRecordByMatchedCtid(xid=T2, ptr=T2_undo, ctid=CTID_X)：
+      遍历T2的undo链 → 找不到CTID_X
+      读到T2第一条undo记录：TdPreXid=T1 → 跳转！
+        curXid=T1, curPtr=T1_undo, matchedCsn=100
+      遍历T1的undo链 → 找到CTID_X的undo记录
+      返回：xid=T1, csn=100
+
+    txnVisible = XidVisible(snapshot=150, csn=100) = true ✓
+    返回 T1 的 tuple 版本
+
+✻ Churned for 4m 58s
+
+❯ 这里提到t1和t2两个事务修改使用的td都是同一个tuple的td吗
+
+⏺ 不是同一个 tuple。T1 和 T2 共享的是同一个 TD 槽位，但各自修改的可以是页面上完全不同的 tuple。
+
+  ---
+  TD 槽位是页级资源，不是 tuple 级
+
+  一个页面有多个 TD 槽（最多256个），一个事务在同一页面上只需要一个 TD 槽，该事务在这个页面上修改的所有 tuple 都指向同一个 TD。
+
+  页面结构：
+  ┌─────────────────────────────────┐
+  │  TD[0]: XID=T1, CSN=100        │  ← T1 占用的槽位
+  │  TD[1]: XID=T3, ...            │
+  │  TD[2]: UNOCCUPIED             │
+  │  ...                           │
+  ├─────────────────────────────────┤
+  │  Tuple A: tdId=0, NEW_OWNER    │  ← T1 修改的
+  │  Tuple B: tdId=0, NEW_OWNER    │  ← T1 修改的
+  │  Tuple C: tdId=1, NEW_OWNER    │  ← T3 修改的
+  │  Tuple D: (空闲)               │
+  └─────────────────────────────────┘
+
+  ---
+  TD[0] 被 T2 复用的场景
+
+  T2 进来需要一个 TD 槽，TD[0] 被选中复用（T1 已提交但 CSN 还不够老）：
+
+  TD[0] 被 T2 复用后：
+    XID=T2, CSN=100(T1保留), csnStatus=IS_PREV_XID_CSN, undoPtr=T2_undo
+
+  Tuple A: tdId=0, ATTACH_TD_AS_HISTORY_OWNER  ← T1 修改的，TD被复用
+  Tuple B: tdId=0, ATTACH_TD_AS_HISTORY_OWNER  ← T1 修改的，TD被复用
+  Tuple D: tdId=0, ATTACH_TD_AS_NEW_OWNER      ← T2 新插入的（完全不同的 tuple）
+
+  T2 修改的是 Tuple D（全新插入），完全没有碰 Tuple A 和 B。
+
+  ---
+  那 undo 跨链跳转是怎么建立的？
+
+  T2 写 Tuple D 时，创建 T2 的第一条 undo 记录，此时 TD[0] 里还残留 T1 的信息：
+
+  T2 第一条 undo 记录：
+    ctid     = Tuple D 的 CTID
+    TdPreInfo = { XID=T1, CSN=100, undoPtr=T1_last_undo }  ← 记录了 TD 复用前的状态
+
+  这条 undo 记录建立了"T2链 → T1链"的跳转桥梁。之后再读 Tuple A（HISTORY_OWNER）时：
+
+  FetchUndoRecordByMatchedCtid(xid=T2, ctid=TupleA_CTID):
+    遍历 T2 的 undo 链：
+      T2的undo记录(TupleD) → ctid不匹配
+      读到 TdPreXid=T1 → 跳转到 T1 的 undo 链
+      T1的undo记录(TupleA) → ctid匹配！找到了
+
+  跳转桥梁只建立在 T2 的「第一条」undo 记录里（那时 TD 还残留 T1 的信息）。T2 后续的 undo 记录里 TdPreXid 就是 T2 自己了，不再有跨链信息。
+
+
+❯ 最后也就是说td[0]这个槽位记录了所有t1和t2的undo记录吗
+
+⏺ 不是。TD 槽位本身不存储 undo 记录，它只存储一个指针。
+
+  ---
+  TD 槽位里只有一个 undoPtr
+
+  TD[0] 在 T2 写入后：
+    XID     = T2
+    undoPtr = T2的最新undo记录地址   ← 只有一个指针，指向 T2 的链尾
+    CSN     = 100 (T1的，IS_PREV_XID_CSN)
+
+  undo 记录本身存储在 undo zone（独立的存储区域），不在页面上。
+
+  ---
+  undo 链的真实结构
+
+  T1 和 T2 各有自己独立的 undo 链，通过每条 undo 记录内部的 m_txnPreUndoPtr 串联：
+
+  Undo Zone：
+
+  T1 的链：
+    [T1_undo_1: TupleA, TdPreInfo={INVALID}] ← T1的第一次写
+          ↑ m_txnPreUndoPtr
+    [T1_undo_2: TupleB, TdPreInfo={XID=T1,...}]  ← T1的第二次写（TD已是T1）
+          ↑
+    T1_last_undo（TD[0]被复用前 undoPtr 指向这里）
+
+  T2 的链：
+    [T2_undo_1: TupleD, TdPreInfo={XID=T1, undoPtr=T1_last_undo}]  ← 桥梁在这里
+          ↑ m_txnPreUndoPtr
+    [T2_undo_2: TupleE, TdPreInfo={XID=T2,...}]
+          ↑
+    TD[0].undoPtr 指向这里（T2的链尾）
+
+  TD[0] 的 undoPtr 始终只指向当前事务（T2）的最新 undo 记录。跨到 T1 链的能力来自 T2_undo_1 内部存储的 TdPreInfo，而不是 TD 槽位本身。
+
