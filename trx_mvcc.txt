@@ -230,3 +230,113 @@
   - TD 槽复用高效：recycleMinCsn 驱动 TD 快速冻结回收，减少 Undo 读取
   - CSN 单调比较：可见性判断退化为一次整数比较，无全局事务表扫描
 
+  也就是说，tuple 落盘时 tdStatus 永远是 ATTACH_TD_AS_NEW_OWNER。
+
+  ---
+  另外两种状态是何时设置的？
+
+  ATTACH_TD_AS_HISTORY_OWNER 和 DETACH_TD 不在写入时设置，而是在 TD 槽位被复用时由 RefreshTupleTdStatus() 批量更新：
+
+  TD 复用（TryReuseTdSlots）
+    ├── 事务已提交，但 csn >= recycleMinCsn（仍有老快照需要它）
+    │     → ATTACH_TD_AS_NEW_OWNER → ATTACH_TD_AS_HISTORY_OWNER
+    │     （告诉读者：TD 已被新事务占用，你需要去 Undo 找旧 CSN 判断可见性）
+    │
+    └── 事务已提交，且 csn < recycleMinCsn（所有活跃快照都不再需要它）
+          → ATTACH_TD_AS_NEW_OWNER → DETACH_TD
+          （告诉读者：这条 tuple 对所有快照永远可见，不用查 TD）
+
+  ---
+  状态转移总结
+
+  写入
+    └─ ATTACH_TD_AS_NEW_OWNER   ← 所有 DML 落盘时的初始状态
+            │
+            │ TD 复用（RefreshTupleTdStatus）
+            ├─→ ATTACH_TD_AS_HISTORY_OWNER   （TD 被新事务占用，但旧快照还需要旧 CSN）
+            │
+            └─→ DETACH_TD                   （事务足够老，永久可见，TD 完全释放）
+
+  所以三种状态代表了 tuple 的"与 TD 关系"的不同阶段，ATTACH_TD_AS_NEW_OWNER 是起点，另外两种状态是 TD 回收时的惰性更新结果。
+
+⏺ 这是理解 dstore MVCC 的关键点。答案很直接：TD 槽位是页内的有限资源，当新事务写入需要 TD 槽而页面已满时，必须回收旧事务的 TD
+  槽，回收前必须更新所有指向该槽的 tuple。
+
+  ---
+  为什么必须更新 tdStatus？
+
+  问题根源：每页的 TD 槽数量有限（最多256个）。
+
+  场景：
+
+  页面有 N 个 TD 槽，全部被已提交事务占用
+            ↓
+  新事务要写入这个页面，需要一个 TD 槽
+            ↓
+  必须回收一个旧事务的 TD 槽给新事务用
+            ↓
+  回收后，新事务会覆盖这个 TD 的 XID/CSN 内容
+            ↓
+  原来指向这个 TD 的 tuple 怎么办？
+
+  如果不更新这些 tuple 的 tdStatus，读取时用 tuple.m_tdId 去查 TD，得到的是新事务的 XID/CSN，可见性判断就完全错了。
+
+  ---
+  回收前做什么
+
+  TryReuseTdSlots() → RefreshTupleTdStatus() 遍历页上所有 tuple，把指向被回收 TD 的 tuple 更新：
+
+  // src/page/dstore_data_page.cpp:496-500
+  if (slot.unused) {
+      // TD 完全释放（事务足够老，所有快照都可见）
+      SetTupleTdStatus<tup_type>(offset, DETACH_TD);
+  } else {
+      // TD 被新事务复用，但旧 CSN 仍保留在 TD 中
+      SetTupleTdStatus<tup_type>(offset, ATTACH_TD_AS_HISTORY_OWNER);
+  }
+
+  两种情况的含义：
+
+  DETACH_TD：TD 彻底清空（td->Reset()），tuple 与 TD 断开关系。读取时直接判定该 tuple 对所有快照永远可见，不再需要查 TD。
+
+  ATTACH_TD_AS_HISTORY_OWNER：TD 槽被新事务占用，但 TD 的旧 CSN 被刻意保留（TD 状态设为 OCCUPY_TRX_END，不 Reset）。tuple 保留对该 TD
+  槽的引用，读取时用 TD 里保留的旧 CSN 来判断可见性，如果不可见再去 Undo 链找更老版本。
+
+  ---
+  代码中的保留逻辑
+
+  GetAvailableTd() (src/page/dstore_data_page.cpp:528)：
+
+  } else if (!td->TestStatus(TDStatus::UNOCCUPY_AND_PRUNEABLE)) {
+      td->SetStatus(TDStatus::OCCUPY_TRX_END);  // 保留 CSN，不 Reset
+      // 选 CSN 最小的那个槽给新事务用
+      if (td->TestCsnStatus(IS_CUR_XID_CSN) && td->GetCsn() <= csn) {
+          firstCommitTdSlot = slot.id;
+          csn = td->GetCsn();
+      }
+  }
+
+  为什么选 CSN 最小的？因为 CSN 越小说明事务越老，越早会低于所有活跃快照的 recycleMinCsn，届时 tuple 就能升级为 DETACH_TD，彻底脱离 TD。
+
+  ---
+  完整流程
+
+  新事务需要 TD 槽，页面已满
+           ↓
+  TryReuseTdSlots()
+    ├─ 找出所有已结束事务的 TD
+    ├─ csn < recycleMinCsn（所有活跃快照都不再需要）
+    │     → slot.unused = true
+    └─ csn >= recycleMinCsn（还有老快照可能用到）
+          → slot.unused = false
+           ↓
+  RefreshTupleTdStatus()  ← 遍历页上所有 tuple，in-place 修改
+    ├─ slot.unused == true  → tuple.tdStatus = DETACH_TD
+    └─ slot.unused == false → tuple.tdStatus = ATTACH_TD_AS_HISTORY_OWNER
+           ↓
+  GetAvailableTd()
+    ├─ unused 的 TD → td->Reset()，分配给新事务
+    └─ 非 unused 的 TD → 保留旧 CSN（不 Reset），分配给新事务写入新 XID
+
+  本质：这是一种惰性清理设计。tuple 提交时不立即更新 tdStatus，而是推迟到有新写入需要回收 TD 槽时才做批量更新。代价是每次回收 TD
+  时需要扫描页上所有 tuple，收益是避免了提交路径上的额外页面写入。
