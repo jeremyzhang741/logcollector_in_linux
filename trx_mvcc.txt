@@ -1,0 +1,232 @@
+  ---
+  核心设计思路
+
+  dstore 的 MVCC 采用 Undo-based 旧版本重建 模式（不同于 PostgreSQL 的 append 多版本）：
+  - 数据页上只存最新版本
+  - 旧版本通过逆序回放 Undo 记录动态重建
+  - 以 CSN（Commit Sequence Number） 作为可见性判断依据
+
+  ---
+  1. Tuple 头部结构
+
+  include/tuple/dstore_heap_tuple.h：
+
+  struct HeapDiskTuple : public DataTuple {
+      union {
+          struct TupleField {
+              uint8     m_tdId;        // 指向页内 TD 槽位（最多256个）
+              uint8     m_lockerTdId;  // 行锁持有者 TD
+              uint16    m_size;
+              Xid       m_xid;         // 最后修改该 tuple 的 XID（缓存用）
+          };
+      } m_ext_info;
+
+      union {
+          uint32 m_info;
+          struct {
+              uint32 m_hasNull     : 1;
+              uint32 m_tdStatus    : 2;  // DETACH_TD / ATTACH_TD_AS_NEW_OWNER / ATTACH_TD_AS_HISTORY_OWNER
+              uint32 m_liveMode    : 3;  // INSERT / INPLACE_UPDATE / SAME_PAGE_UPDATE / DELETE ...
+              uint32 m_numColumn   : 11;
+              // ...
+          };
+      } m_info;
+
+      char m_data[];  // 实际列数据
+  };
+
+  两个关键字段：
+  - m_tdStatus：标记 Tuple 与 TD 的关系（三种状态，见下）
+  - m_liveMode：标记 Tuple 的版本类型（是否是旧版本、是否被删除）
+
+  ---
+  2. TD 状态与 Tuple 的绑定关系
+
+  TupleTdStatus（include/page/dstore_td.h）：
+
+  ┌────────────────────────────┬────────────────────────────────────────────────┐
+  │            状态            │                      含义                      │
+  ├────────────────────────────┼────────────────────────────────────────────────┤
+  │ DETACH_TD                  │ 与 TD 脱离，事务已冻结，永远可见               │
+  ├────────────────────────────┼────────────────────────────────────────────────┤
+  │ ATTACH_TD_AS_NEW_OWNER     │ 当前 TD 所属事务是最新修改者                   │
+  ├────────────────────────────┼────────────────────────────────────────────────┤
+  │ ATTACH_TD_AS_HISTORY_OWNER │ TD 被复用，该 Tuple 是旧版本，需通过 Undo 重建 │
+  └────────────────────────────┴────────────────────────────────────────────────┘
+
+  HeapDiskTupLiveMode - Tuple 版本类型：
+
+  TUPLE_BY_NORMAL_INSERT            // 正常插入
+  NEW_TUPLE_BY_INPLACE_UPDATE       // 原地更新后的新版本
+  OLD_TUPLE_BY_SAME_PAGE_UPDATE     // 同页更新的旧版本（仍在页上）
+  OLD_TUPLE_BY_ANOTHER_PAGE_UPDATE  // 跨页更新的旧版本
+  NEW_TUPLE_BY_ANOTHER_PAGE_UPDATE  // 跨页更新的新版本
+  TUPLE_BY_NORMAL_DELETE            // 已被删除
+
+  ---
+  3. 可见性判断主流程
+
+  HeapPage::GetVisibleTuple() (src/page/dstore_heap_page.cpp:160)：
+
+  读取页上 Tuple
+       ↓
+  获取 Tuple 的 TD（通过 m_tdId）
+       ↓
+  判断 m_tdStatus：
+
+    DETACH_TD
+      → needUndo = false（已冻结，直接可见）
+
+    ATTACH_TD_AS_HISTORY_OWNER
+      → needUndo = td->TestCsnStatus(IS_INVALID)
+                 || !XidVisibleToSnapshot(snapshot, td->GetCsn())
+      （CSN 无效或 TD 中记录的 CSN 不可见 → 需要查 Undo）
+
+    ATTACH_TD_AS_NEW_OWNER
+      → 判断是否是当前事务：
+          是当前事务 → CidVisibleToSnapshot(td->GetCommandId())
+          非当前事务 → XidVisibleToSnapshot(snapshot, xid)
+       needUndo = !上述结果
+
+       ↓
+  needUndo == true → ConstructCrTuple()（逆序回放 Undo 重建旧版本）
+  needUndo == false → 返回页上当前版本
+
+  ---
+  4. CSN 可见性判断
+
+  include/transaction/dstore_transaction.h:628：
+
+  // 已提交事务的 CSN 可见性（最常用路径）
+  inline bool XidVisibleToSnapshot(Snapshot snapshot, CommitSeqNo csn) {
+      return csn < snapshot->GetCsn();   // tuple 的提交时间 < 快照时间
+  }
+
+  // 命令级可见性（同一事务内）
+  inline bool CidVisibleToSnapshot(Transaction *txn, Snapshot snapshot, CommandId cid) {
+      return (!txn->IsCurCidUsed() && txn->GetCurCid() == snapshot->GetCid())
+             || cid < snapshot->GetCid();
+  }
+
+  XidVisibleToSnapshot()完整版本处理的边界情况（dstore_transaction.cpp:1313）：
+
+  XID → 查 XidStatus（先查 TD，再查 Undo Zone）
+    ├── Frozen        → true（老事务，已冻结）
+    ├── Aborted       → false
+    ├── SNAPSHOT_DIRTY → true（脏读模式，见所有非 Abort）
+    ├── PendingCommit → WaitForTransactionEnd() → 等待完成后重判 CSN
+    ├── Committed     → csn < snapshot->GetCsn()
+    └── InProgress    → false
+
+  PendingCommit 是关键边界：Commit WAL 已写但 CSN 尚未最终落盘，需等待完成再比较。
+
+  ---
+  5. Undo 链回放重建旧版本
+
+  HeapPage::ConstructCrTuple() (src/page/dstore_heap_page.cpp:875)：
+
+  起点：页上最新 Tuple + 其 TD
+
+  循环：
+    1. 从 TD 获取 XID、CSN、UndoRecPtr
+    2. FetchUndoRecordByMatchedCtid() 取该事务对此 Tuple 的 Undo 记录
+    3. 判断该事务对快照是否可见：
+         当前事务 → CidVisibleToSnapshot(record.GetCid())
+         其他事务 → XidVisibleToSnapshot(snapshot, xid)
+    4. 可见 → 检查 liveMode：
+         DELETE / OLD_BY_ANOTHER_PAGE_UPDATE → 返回 nullptr（快照中此时已删）
+         否则 → 返回当前 tuple 内容（重建完毕）
+    5. 不可见 → ConstructCrTupleFromUndo(record) 从 Undo 恢复更老的版本
+                 更新 tupleTdId → 继续循环
+
+  ConstructCrTupleFromUndo() 按 Undo 类型还原：
+
+  switch (record->GetUndoType()) {
+      case UNDO_HEAP_DELETE:                              // 还原删前内容
+      case UNDO_HEAP_INPLACE_UPDATE:                     // 还原原地更新前内容
+      case UNDO_HEAP_SAME_PAGE_APPEND_UPDATE:            // 还原同页更新前内容
+      case UNDO_HEAP_ANOTHER_PAGE_APPEND_UPDATE_OLD_PAGE: // 还原跨页更新前内容
+  }
+
+  ---
+  6. TD 槽位复用机制（MVCC 关键设计）
+
+  页内 TD 槽位有限（最多256个），已提交事务的 TD 必须回收复用。
+
+  DataPage::TryReuseTdSlots() (src/page/dstore_data_page.cpp:344)：
+
+  判断能否复用一个 TD：
+
+  对每个 TD 槽：
+    获取 XidStatus → 检查 CSN：
+
+    TD_RECYCLE_UNUSED（完全冻结）：
+      csn < recycleMinCsn（所有活跃快照的最小 CSN）
+      → 不再有任何快照需要看此 TD 的旧版本
+      → tuple 的 tdStatus 改为 DETACH_TD（永久可见）
+
+    TD_RECYCLE_REUSE（保留 CSN）：
+      事务已提交，但 csn >= recycleMinCsn
+      → 仍有老快照可能需要判断此版本
+      → tuple 的 tdStatus 改为 ATTACH_TD_AS_HISTORY_OWNER（保留 CSN 供判断）
+      → 新事务占用此 TD，写入新 XID
+
+    TD_IS_IN_PROGRESS：
+      → 不可复用（事务进行中）
+
+    TD_CONTENT_UPDATED（事务已 Abort）：
+      → 不可复用（Undo 回滚尚未完成）
+
+  RefreshTupleTdStatus() 批量更新页内所有指向被复用 TD 的 Tuple：
+
+  ATTACH_TD_AS_NEW_OWNER → ATTACH_TD_AS_HISTORY_OWNER  （TD 将被新事务复用）
+  ATTACH_TD_AS_NEW_OWNER → DETACH_TD                   （TD 完全冻结）
+
+  这是 MVCC 正确性的关键：TD 复用后，老 Tuple 通过 ATTACH_TD_AS_HISTORY_OWNER 状态告知读者："请用 TD 中保留的旧 CSN 来判断可见性，需要时从 Undo
+   重建"。
+
+  ---
+  7. 快照建立时机
+
+  Transaction::SetSnapshotCsn() (dstore_transaction.cpp:1513)：
+
+  SetThrdLocalCsn(MAX_COMMITSEQNO)    // 相当于"加锁"，阻止自己的 CSN 被纳入全局最小 CSN
+  → GetNextCsn(csn, false)            // 读当前全局 CSN（不递增）
+  → GetCursorSnapshotMinCsn()         // 考虑游标打开时的最小 CSN
+  → SetThrdLocalCsn(min(csn, cursor)) // 释放锁，注册自己的快照 CSN
+  → m_snapshot.SetCsn(csn)           // 设置快照
+
+  - READ COMMITTED：每条 SQL 语句开始时重建快照 → 能看到语句开始前已提交的数据
+  - TRANSACTION SNAPSHOT：事务开始时建立，整个事务共享同一快照
+
+  ---
+  整体流程图
+
+  写事务（UPDATE）：
+    ┌─────────────────────────────────────────────────────┐
+    │ 1. AllocTd() 在页面分配 TD 槽（可能复用旧槽位）        │
+    │ 2. 写 Undo Record（记录操作前的 TD 快照 + 旧 Tuple 数据）│
+    │ 3. 更新页上 Tuple（写新版本内容 + 更新 TD: XID/UndoPtr）│
+    │ 4. tuple.m_tdStatus = ATTACH_TD_AS_NEW_OWNER         │
+    │ 5. 写 WAL（数据页 WAL）                               │
+    │ 6. 提交 → CsnMgr 原子分配 CSN → TD.csn = newCsn      │
+    └─────────────────────────────────────────────────────┘
+
+  读事务（SELECT with snapshot CSN=S）：
+    ┌─────────────────────────────────────────────────────┐
+    │ 1. 扫描页面拿到最新 Tuple                             │
+    │ 2. 查 Tuple.m_tdId → 对应 TD                         │
+    │ 3. 判断 m_tdStatus：                                  │
+    │      DETACH_TD           → 可见                       │
+    │      ATTACH_TD_AS_HISTORY → td.csn < S ? 可见:查Undo  │
+    │      ATTACH_TD_AS_NEW    → XidVisible(xid, S) ?      │
+    │ 4. 不可见 → 逆序遍历 Undo 链重建历史版本              │
+    │ 5. 找到第一个满足 csn < S 的版本返回                  │
+    └─────────────────────────────────────────────────────┘
+
+  ---
+  核心优势：
+  - 无版本链存储开销：历史版本不占用数据页空间，按需从 Undo 重建
+  - TD 槽复用高效：recycleMinCsn 驱动 TD 快速冻结回收，减少 Undo 读取
+  - CSN 单调比较：可见性判断退化为一次整数比较，无全局事务表扫描
+
