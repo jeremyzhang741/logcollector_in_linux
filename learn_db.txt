@@ -1,0 +1,668 @@
+⏺ 下面是专门为数据库内核新手设计的 dstore 学习路线，从基础概念到代码实战。
+
+  ---
+  一、先修知识地图
+
+  在读代码前，需要建立这些基础概念。标 ⭐ 的是必须先懂的。
+
+  ⭐ 存储基础
+
+  ┌─────────────────┬───────────────────────────────────────────────────────────────┐
+  │      概念       │                             要点                              │
+  ├─────────────────┼───────────────────────────────────────────────────────────────┤
+  │ Page / Block    │ 磁盘 I/O 的最小单位（通常 8KB），数据库所有读写以 page 为粒度 │
+  ├─────────────────┼───────────────────────────────────────────────────────────────┤
+  │ Buffer Pool     │ 磁盘 page 在内存中的缓存，类比操作系统的 page cache           │
+  ├─────────────────┼───────────────────────────────────────────────────────────────┤
+  │ WAL（预写日志） │ 修改落盘前必须先写日志，保证崩溃可恢复                        │
+  ├─────────────────┼───────────────────────────────────────────────────────────────┤
+  │ Checkpointing   │ 定期把内存脏页刷盘，缩短崩溃恢复时间                          │
+  └─────────────────┴───────────────────────────────────────────────────────────────┘
+
+  ⭐ 事务基础
+
+  ┌────────────────┬────────────────────────────────────────────────────┐
+  │      概念      │                        要点                        │
+  ├────────────────┼────────────────────────────────────────────────────┤
+  │ ACID           │ 原子性、一致性、隔离性、持久性                     │
+  ├────────────────┼────────────────────────────────────────────────────┤
+  │ MVCC           │ 多版本并发控制：读不阻写、写不阻读，通过版本链实现 │
+  ├────────────────┼────────────────────────────────────────────────────┤
+  │ 快照隔离       │ 事务看到的是某一时刻的数据快照，不受并发事务影响   │
+  ├────────────────┼────────────────────────────────────────────────────┤
+  │ Undo Log       │ 记录操作前的状态，用于回滚和 MVCC 旧版本重建       │
+  ├────────────────┼────────────────────────────────────────────────────┤
+  │ Redo Log / WAL │ 记录操作后的状态，用于崩溃恢复                     │
+  └────────────────┴────────────────────────────────────────────────────┘
+
+  ⭐ 并发控制基础
+
+  ┌──────────┬────────────────────────────────────────────────────────────┐
+  │   概念   │                            要点                            │
+  ├──────────┼────────────────────────────────────────────────────────────┤
+  │ Latch    │ 短期内存锁（读写锁），保护数据结构访问，dstore 里叫 LWLock │
+  ├──────────┼────────────────────────────────────────────────────────────┤
+  │ Lock     │ 长期语义锁（行锁、表锁），保护事务语义，持续到事务结束     │
+  ├──────────┼────────────────────────────────────────────────────────────┤
+  │ 两者区别 │ Latch 是实现机制，Lock 是数据库语义，不要混淆              │
+  └──────────┴────────────────────────────────────────────────────────────┘
+
+  C++ 知识
+
+  - 模板（template）、内联函数
+  - union 内存布局（位域 bitfield）
+  - atomic 操作
+  - 内存对齐（alignas）
+
+  ---
+  二、dstore 整体架构
+
+  模块全景图
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                   StorageInstance（框架层）                   │
+  │         统一管理所有子系统的生命周期和线程                      │
+  └──────────────────┬──────────────────────────────────────────┘
+                     │
+     ┌───────────────┼───────────────────────────────┐
+     │               │                               │
+     ▼               ▼                               ▼
+  ┌──────┐      ┌──────────┐                  ┌──────────┐
+  │ Heap │      │  Index   │                  │Tablespace│
+  │(表)  │      │ (B-tree) │                  │(存储组织)│
+  └──┬───┘      └────┬─────┘                  └────┬─────┘
+     │               │                             │
+     └───────────────┴─────────────┬───────────────┘
+                                   │
+                ┌──────────────────┼──────────────────┐
+                │                  │                  │
+                ▼                  ▼                  ▼
+           ┌────────┐         ┌────────┐        ┌────────┐
+           │ Buffer │         │  WAL   │        │  Lock  │
+           │ (缓冲池)│         │(日志)  │        │ (锁)   │
+           └────────┘         └────────┘        └────────┘
+                │
+     ┌──────────┴──────────┐
+     │                     │
+     ▼                     ▼
+  ┌──────────┐       ┌──────────┐
+  │Transaction│      │  Undo    │
+  │ (事务)   │       │ (撤销日志)│
+  └──────────┘       └──────────┘
+                │
+     ┌──────────┴──────────┐
+     │                     │
+     ▼                     ▼
+  ┌──────┐           ┌──────────┐
+  │ Page │           │  Tuple   │
+  │(页格式)│          │(行格式)  │
+  └──────┘           └──────────┘
+                │
+                ▼
+           ┌────────┐
+           │ Common │
+           │(基础库) │
+           └────────┘
+
+  各模块一句话描述
+
+  ┌─────────────┬──────────────────┬─────────────────────────────────────┐
+  │    模块     │       目录       │                职责                 │
+  ├─────────────┼──────────────────┼─────────────────────────────────────┤
+  │ Framework   │ src/framework/   │ 引擎初始化、PDB 管理、线程调度      │
+  ├─────────────┼──────────────────┼─────────────────────────────────────┤
+  │ Buffer      │ src/buffer/      │ 页面缓存、LRU 淘汰、脏页写回        │
+  ├─────────────┼──────────────────┼─────────────────────────────────────┤
+  │ WAL         │ src/wal/         │ 预写日志、崩溃恢复                  │
+  ├─────────────┼──────────────────┼─────────────────────────────────────┤
+  │ Transaction │ src/transaction/ │ 事务状态机、CSN、快照、Savepoint    │
+  ├─────────────┼──────────────────┼─────────────────────────────────────┤
+  │ Undo        │ src/undo/        │ Undo 记录存储、旧版本重建、异步回滚 │
+  ├─────────────┼──────────────────┼─────────────────────────────────────┤
+  │ Heap        │ src/heap/        │ 表的增删改查、行锁                  │
+  ├─────────────┼──────────────────┼─────────────────────────────────────┤
+  │ Page        │ src/page/        │ 页面格式读写（heap/index/undo 页）  │
+  ├─────────────┼──────────────────┼─────────────────────────────────────┤
+  │ Tuple       │ src/tuple/       │ 行数据编解码                        │
+  ├─────────────┼──────────────────┼─────────────────────────────────────┤
+  │ Index       │ src/index/       │ B-tree 索引                         │
+  ├─────────────┼──────────────────┼─────────────────────────────────────┤
+  │ Lock        │ src/lock/        │ 行锁、表锁、死锁检测                │
+  ├─────────────┼──────────────────┼─────────────────────────────────────┤
+  │ Tablespace  │ src/tablespace/  │ 文件段、Extent 分配                 │
+  ├─────────────┼──────────────────┼─────────────────────────────────────┤
+  │ Common      │ src/common/      │ 内存管理、数据类型、错误处理        │
+  └─────────────┴──────────────────┴─────────────────────────────────────┘
+
+  ---
+  三、核心数据结构（必须先掌握）
+
+  1. Page 格式
+
+  磁盘上的一个 page（8KB）：
+
+  ┌────────────────────────────────┐ ← page 起始
+  │  PageHeader                    │
+  │  - checksum                    │
+  │  - GLSN / PLSN（WAL 位置）     │
+  │  - pageType                    │
+  │  - flags                       │
+  ├────────────────────────────────┤
+  │  DataHeader（data page 特有）  │
+  │  - tdCount（TD 槽数量）         │
+  │  - freespace 指针              │
+  ├────────────────────────────────┤
+  │  TD 槽区（TD[0], TD[1], ...）  │
+  │  每个 TD: XID, CSN,            │
+  │           undoPtr, status      │
+  ├────────────────────────────────┤
+  │  ItemId 数组（offset 索引）    │  ← 从低地址向高地址增长
+  ├────────────────────────────────┤
+  │         （空闲区域）           │
+  ├────────────────────────────────┤
+  │  Tuple 数据（从高到低增长）    │  ← 从高地址向低地址增长
+  └────────────────────────────────┘
+
+  关键文件：
+  - include/page/dstore_page.h — PageHeader
+  - include/page/dstore_data_page.h — DataPage（含 TD 区）
+  - include/page/dstore_heap_page.h — HeapPage
+
+  2. Tuple 格式
+
+  // include/tuple/dstore_heap_tuple.h
+  struct HeapDiskTuple {
+      uint8     m_tdId;        // 指向页内 TD 槽编号
+      uint8     m_lockerTdId;  // 行锁持有者 TD
+      uint16    m_size;        // tuple 总大小
+      Xid       m_xid;         // 最后修改者 XID（缓存）
+
+      uint32 m_tdStatus  : 2;  // DETACH / NEW_OWNER / HISTORY_OWNER
+      uint32 m_liveMode  : 3;  // INSERT / UPDATE / DELETE 版本类型
+      uint32 m_hasNull   : 1;
+      uint32 m_numColumn : 11;
+      // ...
+
+      char m_data[];           // null bitmap + 列数据
+  };
+
+  3. TD（Transaction Descriptor）
+
+  // include/page/dstore_td.h
+  struct TD {
+      uint64      m_xid;        // 当前占用者 XID
+      CommitSeqNo m_csn;        // 提交 CSN（提交后填入）
+      uint64      m_undoRecPtr; // 指向最新 undo 记录
+      uint64      m_lockerXid;  // 行锁持有者
+      CommandId   m_commandId;  // SQL 语句编号
+      uint16      m_status : 2; // UNOCCUPY / IN_PROGRESS / END
+      uint16      m_csnStatus:2;// IS_INVALID / IS_PREV / IS_CUR
+  };
+
+  4. XID 结构
+
+  // include/transaction/dstore_transaction_types.h
+  union Xid {
+      uint64 m_placeHolder;
+      struct {
+          uint64 m_zoneId     : 20;  // Undo Zone 编号
+          uint64 m_logicSlotId: 44;  // Zone 内事务槽编号
+      };
+  };
+
+  5. Undo Record
+
+  // include/undo/dstore_undo_record.h
+  struct UndoRecordHeader {
+      UndoType   m_undoType;      // INSERT / UPDATE / DELETE
+      CommandId  m_cid;
+      UndoTdInfo m_tdPreInfo;     // 操作前的 TD 快照（含旧 XID/CSN/undoPtr）
+      uint64     m_txnPreUndoPtr; // 同事务上一条 undo 记录（链表）
+      uint64     m_ctid;          // 被修改的 tuple 位置
+      uint64     m_fileVersion;
+  };
+
+  ---
+  四、学习路线（分阶段）
+
+  阶段一：读懂数据如何在磁盘/内存中存放（1-2周）
+
+  目标：能画出一个 heap page 的内存布局，知道 tuple 在哪里。
+
+  按顺序阅读：
+  1. include/page/dstore_page.h           — 最基础的 Page 结构
+  2. include/page/dstore_data_page.h      — DataPage（含 TD、ItemId）
+  3. include/page/dstore_heap_page.h      — HeapPage 特有方法
+  4. include/tuple/dstore_data_tuple.h    — TupleTdStatus、LiveMode 枚举
+  5. include/tuple/dstore_heap_tuple.h    — HeapDiskTuple 完整结构
+  6. include/page/dstore_td.h             — TD 结构和三种状态
+  7. include/page/dstore_itemid.h         — ItemId（slot 数组）
+
+  动手练习：在纸上画出一个页面，里面有 2 个 TD 槽、3 个 tuple 的布局。
+
+  ---
+  阶段二：读懂事务和 MVCC（2-3周）
+
+  目标：能描述一个 tuple 从插入到被另一个事务读取的全过程。
+
+  2.1 事务基础类型
+
+  include/transaction/dstore_transaction_types.h   — Xid、CSN、隔离级别
+  include/transaction/dstore_csn_mgr.h             — CSN 分配
+  interface/transaction/dstore_transaction_struct.h — Snapshot、TrxEvent
+
+  2.2 事务生命周期
+
+  include/transaction/dstore_transaction.h  — Transaction 类接口
+  src/transaction/dstore_transaction.cpp    — 重点读：
+      - StartInternal()   (line ~246)
+      - CommitInternal()  (line ~287)
+      - AbortInternal()   (line ~338)
+      - SetSnapshotCsn()  (line ~1513)
+      - XidVisibleToSnapshot() (line ~1313)
+
+  2.3 Undo 结构
+
+  include/undo/dstore_undo_record.h     — Undo 记录格式
+  include/undo/dstore_undo_zone.h       — Undo Zone 管理
+  include/undo/dstore_transaction_slot.h — TrxSlotStatus 枚举
+  src/undo/dstore_undo_zone.cpp         — InsertUndoRecord() (line ~637)
+
+  2.4 可见性判断（MVCC 核心）
+
+  src/page/dstore_heap_page.cpp
+      - GetVisibleTuple()       (line ~160)  — 可见性入口
+      - ConstructCrTuple()      (line ~875)  — undo 链回放
+      - ConstructCrTupleFromUndo() (line ~819) — 按类型恢复
+
+  src/transaction/dstore_transaction_mgr.cpp
+      - FetchUndoRecordByMatchedCtid() (line ~825)  — 跨事务 undo 链遍历
+
+  动手练习：在纸上画出 T1 插入一行、T2 更新、T3 使用旧快照读取的完整流程。
+
+  ---
+  阶段三：读懂 Heap 写入路径（1-2周）
+
+  目标：能 trace 一次 INSERT 从 SQL 到磁盘的完整调用链。
+
+  3.1 INSERT
+
+  src/heap/dstore_heap_insert.cpp
+      - InsertSmallDiskTup()    (line ~411)   主流程
+      关键步骤：
+        AllocTd → WriteUndo → AddTuple → SetTd → MarkDirty → WriteWAL
+
+  3.2 UPDATE
+
+  src/heap/dstore_heap_update.cpp
+      - UpdateSmallTupleInplace()  (line ~702)  原地更新
+      - UpdateSamePageAppend()     同页追加更新
+      - UpdateAnotherPageAppend()  跨页更新
+
+  3.3 DELETE
+
+  src/heap/dstore_heap_delete.cpp
+      - DeleteDiskTuple()   (line ~268)
+
+  3.4 Buffer 管理
+
+  include/buffer/dstore_buf_mgr.h
+  src/buffer/dstore_buf_mgr.cpp
+      - Read()      — 加 latch 读入 buffer
+      - MarkDirty() — 标记脏页 (line ~874)
+      - WriteBlock() — 实际落盘（WAL-first 保证）(line ~1042)
+
+  ---
+  阶段四：TD 回收与并发边界（1周）
+
+  目标：理解多事务并发写同一页面时的完整逻辑。
+
+  src/page/dstore_data_page.cpp
+      - DoAllocTd()         (line ~199)   TD 分配主逻辑
+      - TryReuseTdSlots()   (line ~344)   TD 回收
+      - RefreshTupleTdStatus() (line ~452) 批量更新 tuple 状态
+      - GetAvailableTd()    (line ~506)   选择最优 TD 槽
+
+  include/page/dstore_data_page.h
+      - SetTd()             (line ~158)   TD 占用（含 IS_PREV_XID_CSN 切换）
+
+  ---
+  阶段五：WAL 与崩溃恢复（按需）
+
+  src/wal/                             — WAL 写入
+  src/heap/dstore_heap_wal_struct.cpp  — 各操作的 WAL 记录格式
+  include/wal/dstore_wal_struct.h      — WAL 记录结构定义
+
+  ---
+  五、调试建议
+
+  读代码的方法
+
+  1. 从接口开始：先读 include/ 里的头文件，了解接口和数据结构，再去 src/ 看实现
+  2. 跟着数据流走：选一个操作（如 INSERT），从入口函数开始，一步步 trace 每个关键变量的变化
+  3. 画状态机：TD 状态、事务状态、tuple 的 liveMode，都是状态机，画出来比读代码快
+
+  关键搜索技巧
+
+  # 找某个函数的实现
+  grep -r "函数名" src/ --include="*.cpp" -n
+
+  # 找某个枚举的所有使用
+  grep -r "ATTACH_TD_AS_NEW_OWNER" src/ --include="*.cpp" -n
+
+  # 找某个数据结构的定义
+  grep -r "struct TD " include/ -n
+
+  建议的问题思路
+
+  遇到代码问题时，按这个顺序排查：
+  1. 确认问题在哪个模块（Buffer? Transaction? Undo? Heap?）
+  2. 找到该操作的入口函数
+  3. 找到涉及的数据结构（TD? Tuple? UndoRecord?）
+  4. 用 grep 搜相关状态的所有修改点
+  5. 分析并发场景：这段代码在什么锁保护下执行？
+
+  ---
+  六、重要文件速查表
+
+  ┌────────────────┬────────────────────────────────────────┐
+  │     想了解     │              先读这个文件              │
+  ├────────────────┼────────────────────────────────────────┤
+  │ 整体初始化流程 │ src/framework/dstore_instance.cpp      │
+  ├────────────────┼────────────────────────────────────────┤
+  │ 事务生命周期   │ src/transaction/dstore_transaction.cpp │
+  ├────────────────┼────────────────────────────────────────┤
+  │ CSN 分配       │ src/transaction/dstore_csn_mgr.cpp     │
+  ├────────────────┼────────────────────────────────────────┤
+  │ Tuple 可见性   │ src/page/dstore_heap_page.cpp          │
+  ├────────────────┼────────────────────────────────────────┤
+  │ INSERT 实现    │ src/heap/dstore_heap_insert.cpp        │
+  ├────────────────┼────────────────────────────────────────┤
+  │ UPDATE 实现    │ src/heap/dstore_heap_update.cpp        │
+  ├────────────────┼────────────────────────────────────────┤
+  │ DELETE 实现    │ src/heap/dstore_heap_delete.cpp        │
+  ├────────────────┼────────────────────────────────────────┤
+  │ TD 分配/回收   │ src/page/dstore_data_page.cpp          │
+  ├────────────────┼────────────────────────────────────────┤
+  │ Undo 写入      │ src/undo/dstore_undo_zone.cpp          │
+  ├────────────────┼────────────────────────────────────────┤
+  │ Buffer 管理    │ src/buffer/dstore_buf_mgr.cpp          │
+  ├────────────────┼────────────────────────────────────────┤
+  │ 行锁           │ src/heap/dstore_heap_lock_tuple.cpp    │
+  ├────────────────┼────────────────────────────────────────┤
+  │ WAL 格式       │ include/wal/dstore_wal_struct.h        │
+  └────────────────┴────────────────────────────────────────┘
+
+
+⏺ 多事务并发写同一页面的核心问题是：页面上的 TD 槽是有限的，多个事务竞争同一页面时如何安全地分配和回收 TD 槽。下面逐层拆解。
+
+  ---
+  一、并发的基础保障：页级排他锁
+
+  所有写操作进入页面前必须持有 LW_EXCLUSIVE，这把锁保证了同一时刻只有一个事务在操作页面内容。
+
+  T1 持有 PageA 的 LW_EXCLUSIVE → 执行 AllocTd + 写 Tuple
+  T2 想写 PageA → 阻塞等待
+  T3 想写 PageB → 不受影响，完全并行
+
+  T1 释放锁 → T2 获得锁 → 继续
+
+  所以"并发写同一页面"实际上是串行执行的，TD 分配逻辑在锁保护下不存在竞态。复杂性在于：T1 和 T2 先后写同一页面时，页面上会同时存在多个事务的 TD
+   槽，如何管理这些槽位才是关键。
+
+  ---
+  二、TD 槽的容量
+
+  // include/page/dstore_td.h
+  constexpr uint8 DEFAULT_TD_COUNT = 4;    // 初始槽数
+  constexpr uint8 EXTEND_TD_NUM    = 2;    // 每次扩展增加 2 个
+  constexpr uint8 MAX_TD_COUNT     = 128;  // 上限
+
+  一个新页面初始只有 4 个 TD 槽，可以动态扩展到 128 个。每个事务在某个页面上最多占用一个 TD 槽。
+
+  ---
+  三、AllocTd 完整决策树
+
+  入口是 AllocTd()，它是一个带重试的外壳，内部调用 DoAllocTd()：
+
+  // src/page/dstore_data_page.cpp:244
+  TdId DataPage::AllocTd(TDAllocContext &context) {
+      for (int i = 0; i < 100; ++i) {          // 最多重试 100 次
+          tdId = DoAllocTd<pageType>(context);
+          if (tdId != INVALID_TD_SLOT) break;
+          GaussUsleep(10L);                     // 等 10 微秒再试
+      }
+  }
+
+  DoAllocTd() 的四步决策（src/page/dstore_data_page.cpp:199）：
+
+  DoAllocTd():
+
+  Step 1: 扫描所有现有 TD 槽
+    ├─ 发现 curXid 已有槽 → 直接复用（同一事务多次写同页面）
+    ├─ 发现 UNOCCUPY_AND_PRUNEABLE 槽 → 记为 firstUseableTdSlot
+    └─ 扫描结束
+
+    if firstUseableTdSlot 有效 → 返回（直接用冻结槽）
+
+  Step 2: 尝试回收已结束事务的 TD 槽（TryReuseTdSlots）
+    → 找到可回收的 → 返回
+
+  Step 3: （跳过，注释残留）
+
+  Step 4: 扩展 TD 区域（ExtendTd）
+    → 页面有足够空间 → 新增 2 个槽 → 返回
+    → 空间不足 → 返回 INVALID_TD_SLOT
+
+  失败 → 上层重试 100 次，每次间隔 10μs
+
+  ---
+  四、TryReuseTdSlots 核心逻辑
+
+  这是最复杂的部分，处理"所有 TD 槽都被已结束事务占用"的场景。
+
+  4.1 TDAllocContext：分配时的上下文
+
+  // include/page/dstore_td.h:68
+  struct TDAllocContext {
+      CommitSeqNo recycleMinCsn;   // 当前所有活跃快照中最小的 CSN
+                                    // 早于此 CSN 提交的事务对所有快照可见，可安全冻结
+      Transaction *txn;
+      TDAllocWALInfo allocTd;      // 记录本次分配操作的 WAL 信息
+      TDReuseWaitInfo waitXids;    // 记录因进行中的事务无法回收时，需等待的 XID 列表
+  };
+
+  recycleMinCsn 是判断 TD 能否彻底释放的关键阈值。
+
+  4.2 TryReuseOneTdSlot：对单个 TD 的判断
+
+  对每个 TD 槽，查询其 XID 的当前状态，得出 TdReuseState：
+
+  TdReuseState:
+
+    TD_RECYCLE_UNUSED  ← 可以彻底清空
+      条件：事务已 Frozen 或 (事务已 Committed 且 csn < recycleMinCsn)
+      含义：所有活跃快照都能看到这个版本，不再需要通过 TD 查询历史
+
+    TD_RECYCLE_REUSE   ← 可以复用但保留旧 CSN
+      条件：事务已 Committed 且 csn >= recycleMinCsn
+      含义：还有老快照可能需要这个 CSN 判断可见性
+
+    TD_IS_IN_PROGRESS  ← 不可回收
+      条件：事务还在进行中
+      副作用：记入 waitXids，标记 canResetTd = false
+
+    TD_CONTENT_UPDATED ← 不可回收（仅 Index 页）
+      条件：事务已 Aborted
+      副作用：需要先执行 Undo 回滚
+
+    TD_IGNORE          ← 忽略（远端节点的 XID，tryLocalXidOnly 模式下跳过）
+
+  4.3 TryReuseTdSlots 完整流程
+
+  // src/page/dstore_data_page.cpp:344
+  TryReuseTdSlots():
+
+    bool canResetTd = true;
+    // 存在进行中的事务时 canResetTd = false
+    // 原因：进行中的事务如果之后 Abort，需要能把 tuple 回滚到 DETACH_TD
+    //       但如果我们已经把某个 TD Reset 了，回滚时就找不到对应信息了
+
+    for 每个 TD 槽:
+      查询 XidStatus
+      根据状态分类放入 tdRecycle[] 数组
+
+    if tdRecycleNum > 0:
+      RefreshTupleTdStatus()  // 批量更新页上所有相关 tuple 的 tdStatus
+      GetAvailableTd()        // 选出一个槽返回
+    else:
+      return INVALID_TD_SLOT  // 所有槽都是进行中，分配失败
+
+  4.4 RefreshTupleTdStatus：更新 tuple 状态
+
+  遍历页上所有 tuple，找到指向被回收 TD 的 tuple，更新其 m_tdStatus：
+
+  slot.unused == true（彻底冻结）：
+    tuple.tdStatus → DETACH_TD
+    含义：永久可见，不再需要查 TD
+
+  slot.unused == false（保留历史）：
+    tuple.tdStatus → ATTACH_TD_AS_HISTORY_OWNER
+    含义：TD 被新事务占用，但旧 CSN 保留在 TD 里，读时用旧 CSN 判断可见性
+
+  4.5 GetAvailableTd：选择最优槽位
+
+  // src/page/dstore_data_page.cpp:506
+  优先级：
+    1. canResetTd && slot.unused → td->Reset() 彻底清空，返回（最干净）
+    2. slot.unused 但 canResetTd=false → 有进行中的事务，不能 Reset
+       （因为进行中的事务 Abort 时需要知道旧状态）
+    3. slot 非 unused → td->SetStatus(OCCUPY_TRX_END)，保留旧 CSN
+       从中选 CSN 最小的（最老的事务），它最快能变成 UNUSED
+
+  ---
+  五、ExtendTd：扩展 TD 区域
+
+  当所有现有 TD 都被进行中的事务占用（无法回收）时，尝试在页面上物理扩展 TD 区域：
+
+  // src/page/dstore_data_page.cpp:98
+  ExtendTd():
+    检查：tdNum < MAX_TD_COUNT（还能扩）
+    检查：页面剩余空间 >= sizeof(TD)（有地方放）
+
+    // 物理操作：ItemId 数组整体向后移动，给新 TD 腾位置
+    memmove_s(start + numExtended * sizeof(TD), size, start, size)
+
+    // 初始化新 TD 槽
+    for i in [tdNum, tdNum + numExtended):
+        GetTd(i)->Reset()
+
+    dataHeader.tdCount += numExtended
+    m_header.m_lower   += numExtended * sizeof(TD)
+
+  注意：ExtendTd 会压缩页面可用空间，因为 TD 区域扩展占用了原来用于存 tuple 的空间。
+
+  ---
+  六、完整并发场景演示
+
+  初始状态：PageA 有 4 个 TD 槽，全空
+
+  T1 写入：
+    持有 PageA LW_EXCLUSIVE
+    DoAllocTd → Step1 扫描 → 发现 TD[0] 是 UNOCCUPY → 返回 TD[0]
+    SetTd(TD[0], XID=T1, undoPtr=T1_undo)
+    写 TupleA(tdId=0, NEW_OWNER)
+    释放锁
+
+  T2 写入：
+    持有 PageA LW_EXCLUSIVE
+    DoAllocTd → Step1 扫描 → TD[0] XID=T1≠T2, TD[1-3] UNOCCUPY
+              → firstUseableTdSlot = TD[1] → 返回 TD[1]
+    SetTd(TD[1], XID=T2, undoPtr=T2_undo)
+    写 TupleB(tdId=1, NEW_OWNER)
+    释放锁
+
+  （T1 T2 T3 T4 各占一个槽，4个槽全满，T1~T4 均未提交）
+
+  T5 写入：
+    持有 PageA LW_EXCLUSIVE
+    DoAllocTd → Step1: 4个槽都被别的 XID 占用，firstUseableTdSlot=INVALID
+    → Step2: TryReuseTdSlots
+      查 TD[0]~TD[3] 的 XidStatus → 全是 IN_PROGRESS
+      canResetTd = false，tdRecycleNum = 0
+      返回 INVALID
+    → Step4: ExtendTd
+      页面空间足够 → 新增 TD[4] TD[5]
+      返回 TD[4]
+    写 TupleE(tdId=4, NEW_OWNER)
+    释放锁
+
+  T1 提交(CSN=100), T2 提交(CSN=110)
+
+  T6 写入：（假设槽全满且无空余空间扩展）
+    DoAllocTd → Step1: 找不到空槽
+    → Step2: TryReuseTdSlots
+      TD[0]: T1 committed, csn=100 < recycleMinCsn=95?
+             recycleMinCsn=90(当前最老快照) → 100 >= 90 → TD_RECYCLE_REUSE
+      TD[1]: T2 committed, csn=110 >= 90 → TD_RECYCLE_REUSE
+      TD[2]: T3 IN_PROGRESS → TD_IS_IN_PROGRESS, canResetTd=false
+      TD[3]: T4 IN_PROGRESS → TD_IS_IN_PROGRESS, canResetTd=false
+      tdRecycleNum = 2 (TD[0], TD[1])
+
+      RefreshTupleTdStatus:
+        TupleA(tdId=0) → ATTACH_TD_AS_HISTORY_OWNER
+        TupleB(tdId=1) → ATTACH_TD_AS_HISTORY_OWNER
+
+      GetAvailableTd:
+        canResetTd=false, 两个都是非 unused
+        → 选 CSN 最小的: TD[0](csn=100) → SetStatus(OCCUPY_TRX_END)
+        → 返回 TD[0]
+
+    SetTd(TD[0], XID=T6, undoPtr=T6_undo)
+    TD[0]: XID=T6, CSN=100(保留,IS_PREV_XID_CSN)
+    写 TupleF(tdId=0, NEW_OWNER)
+    释放锁
+
+  ---
+  七、canResetTd 为什么重要
+
+  当页面上存在进行中的事务时，canResetTd = false，不能对 TD 执行 Reset()：
+
+  场景：
+    TD[0] = T1（已提交），TD[1] = T2（进行中）
+    T3 要复用 TD[0]
+
+    如果 T2 之后 Abort：
+      系统需要把 T2 修改的 tuple 回滚到之前的状态
+      回滚时通过 tuple → tdId → TD 找到 undo 链
+      如果 TD[0] 被 Reset 了，T2 Abort 时可能影响 TD[0] 的状态
+      → 不安全
+
+    所以 canResetTd=false 时：
+      TD[0] 不执行 Reset()，而是 SetStatus(OCCUPY_TRX_END)
+      保留旧 CSN（IS_PREV_XID_CSN），新事务 T3 写入时
+      旧 CSN 通过 SetTd() 变为 IS_PREV_XID_CSN 保留
+
+  ---
+  八、一句话总结各函数职责
+
+  ┌──────────────────────┬────────────────────────────────────────────────────┐
+  │         函数         │                        职责                        │
+  ├──────────────────────┼────────────────────────────────────────────────────┤
+  │ AllocTd              │ 外层重试壳，最多试 100 次，间隔 10μs               │
+  ├──────────────────────┼────────────────────────────────────────────────────┤
+  │ DoAllocTd            │ 四步决策：复用自己的槽 → 找空槽 → 回收旧槽 → 扩展  │
+  ├──────────────────────┼────────────────────────────────────────────────────┤
+  │ TryReuseTdSlots      │ 扫描所有 TD，分类可回收/不可回收                   │
+  ├──────────────────────┼────────────────────────────────────────────────────┤
+  │ TryReuseOneTdSlot    │ 查询单个 TD 的 XidStatus，决定回收策略             │
+  ├──────────────────────┼────────────────────────────────────────────────────┤
+  │ RefreshTupleTdStatus │ 批量更新页内 tuple 的 tdStatus（在回收前同步状态） │
+  ├──────────────────────┼────────────────────────────────────────────────────┤
+  │ GetAvailableTd       │ 从可回收列表中选最优槽，执行 Reset 或保留 CSN      │
+  ├──────────────────────┼────────────────────────────────────────────────────┤
+  │ ExtendTd             │ 物理扩展 TD 区，memmove ItemId 数组腾空间          │
+  ├──────────────────────┼────────────────────────────────────────────────────┤
+  │ RecycleTd            │ 反向操作，收缩 TD 区（vacuum 时调用）              │
+  └──────────────────────┴────────────────────────────────────────────────────┘
+

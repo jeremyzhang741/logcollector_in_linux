@@ -1,0 +1,109 @@
+⏺ NFS 写入 close() EIO 的解决方案
+
+  ---
+  问题本质
+
+  NFS 的 close() = CLOSE RPC，会强制将 dirty page 同步到服务端。网络抖动、服务端超时、并发写冲突都可能导致此时失败。
+
+  ---
+  方案一：挂载参数优化（治标）
+
+  # /etc/fstab 或 mount 命令
+  mount -t nfs server:/path /mnt \
+    -o hard,           # 网络中断时无限重试（不要用 soft）
+       timeo=600,      # 超时 60s（单位0.1s）
+       retrans=5,      # 重试5次
+       rsize=1048576,  # 读块大小 1MB
+       wsize=1048576,  # 写块大小 1MB
+       async,          # 客户端异步写（性能好但断电风险）
+       noatime         # 不更新 atime，减少写操作
+
+  关键选项对比：
+
+  ┌───────────┬──────────────────────────────┬────────────────────┐
+  │   选项    │             说明             │        推荐        │
+  ├───────────┼──────────────────────────────┼────────────────────┤
+  │ hard      │ 网络恢复后自动重试           │ 必须用             │
+  ├───────────┼──────────────────────────────┼────────────────────┤
+  │ soft      │ 超时直接返回错误             │ 避免               │
+  ├───────────┼──────────────────────────────┼────────────────────┤
+  │ async     │ 写入 client cache 即返回     │ 性能好，有丢失风险 │
+  ├───────────┼──────────────────────────────┼────────────────────┤
+  │ sync      │ 每次写都等服务端确认         │ 安全，慢           │
+  ├───────────┼──────────────────────────────┼────────────────────┤
+  │ actimeo=0 │ 禁用属性缓存（多客户端场景） │ 按需               │
+  └───────────┴──────────────────────────────┴────────────────────┘
+
+  ---
+  方案二：应用层重试（治本）
+
+  在 C 代码里对 close() 失败做重试，但 close() 的重试有陷阱：
+
+  #include <errno.h>
+  #include <unistd.h>
+
+  // 错误做法：直接重试 close()
+  // POSIX 规定 close() 失败后 fd 状态未定义，重试可能关闭另一个 fd！
+  while (close(fd) == -1 && errno == EINTR);  // 只能重试 EINTR
+
+  // 正确做法：EIO 时不重试 close，而是记录错误
+  int ret = close(fd);
+  if (ret == -1 && errno == EIO) {
+      // fd 已关闭，但数据未落盘
+      log_error("write to NFS failed, data lost: %s", path);
+      // 触发告警或走降级逻辑
+  }
+
+  ---
+  方案三：用 fsync() 提前暴露错误
+
+  不要等到 close() 才发现，在关键写入后主动 fsync()：
+
+  int fd = open(path, O_WRONLY | O_CREAT, 0644);
+
+  write(fd, data, len);  // 写数据
+
+  // 主动刷盘，提前检测 NFS 错误
+  if (fsync(fd) == -1) {
+      perror("fsync failed");  // 比 close() 更早报错
+      close(fd);
+      // 处理错误...
+      return -1;
+  }
+
+  close(fd);  // fsync 成功后 close 基本不会再 EIO
+
+  ---
+  方案四：写临时文件 + rename（你项目已用的模式）
+
+  // 写到本地临时文件，完成后 rename 到 NFS
+  // rename 是原子操作，避免半写文件
+
+  char tmp_path[] = "/local/tmp/buf_XXXXXX";
+  int fd = mkstemp(tmp_path);
+  write(fd, data, len);
+  fsync(fd);
+  close(fd);
+
+  // 最后一步才接触 NFS
+  rename(tmp_path, "/nfs/mount/final_path");
+
+  你的 wal_upload.py 里的 buffer file 机制就是这个思路，但如果 buffer 目录本身在 NFS 上则无效。
+
+  ---
+  方案五：NFS 服务端排查
+
+  # 客户端查看 NFS 统计
+  nfsstat -c
+
+  # 查看超时/重传次数（retrans 持续增长说明网络有问题）
+  mountstats /mnt/nfs | grep -E "retrans|timeout"
+
+  # 服务端查看
+  nfsstat -s
+  exportfs -v
+
+  # 抓包确认是否有 NFS RPC 超时
+  tcpdump -i eth0 port 2049 -w nfs.pcap
+
+  ---
