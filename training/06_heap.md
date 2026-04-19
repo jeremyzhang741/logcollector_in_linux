@@ -7,6 +7,7 @@
 4. [SetTd 与 CSN 状态保留](#4-settd-与-csn-状态保留)
 5. [Heap 读取路径](#5-heap-读取路径)
 6. [Heap 写入路径简述](#6-heap-写入路径简述)
+7. [BigTuple：跨页大行存储](#7-bigtuple跨页大行存储)
 
 ---
 
@@ -583,3 +584,259 @@ TD5 = {xid=Txn2, csn=150, undoPtr→U3}
 | ExtendTd() | src/page/dstore_data_page.cpp | 98-151 |
 | GetVisibleTuple() | src/page/dstore_heap_page.cpp | 160-240 |
 | ConstructCrTuple() | src/page/dstore_heap_page.cpp | 875-964 |
+
+---
+
+## 7. BigTuple：跨页大行存储
+
+### 7.1 触发条件
+
+当一行数据超过单页可容纳的最大 Tuple 大小时，触发 BigTuple 分块存储：
+
+```cpp
+// include/page/dstore_heap_page.h
+static bool TupBiggerThanPage(HeapTuple *tuple)
+{
+    return tuple->GetDiskTupleSize() > MaxDefaultTupleSpace();
+}
+
+static uint32 MaxDefaultTupleSpace()
+{
+    // 约 8KB - 页头 - 默认TD数组 - 一个ItemId = ~7.8KB
+    return BLCKSZ - MAXALIGN(HEAP_PAGE_DATA_OFFSET
+                             + DEFAULT_TD_COUNT * sizeof(TD)
+                             + sizeof(ItemId));
+}
+```
+
+**结论**：Tuple 超过约 7.8KB 即触发 BigTuple 分块。
+
+---
+
+### 7.2 BigTuple 的存储结构
+
+BigTuple 将原始 Tuple 切分成多个 **Chunk**，每个 Chunk 是一个独立的 `HeapDiskTuple`，存储在普通 Heap 页中，通过链表串联。
+
+#### Chunk 布局
+
+```
+┌─────────────────────────────────────────────────┐
+│              首 Chunk（First Chunk）             │
+│  HeapDiskTuple header（含 m_linkInfo=FIRST）     │
+│  NextChunkCtid（8B，指向第2个chunk的ItemPointer）│
+│  NumTupChunks（4B，总chunk数量）                 │
+│  原始Tuple数据（第1段）                          │
+└─────────────────────────────────────────────────┘
+         │ NextChunkCtid
+         ▼
+┌─────────────────────────────────────────────────┐
+│            后续 Chunk（Not-First Chunk）          │
+│  HeapDiskTuple header（含 m_linkInfo=NOT_FIRST） │
+│  NextChunkCtid（8B，指向下一chunk或INVALID）     │
+│  NumTupChunks（4B，占位，与首chunk相同）         │
+│  原始Tuple数据（第N段）                          │
+└─────────────────────────────────────────────────┘
+         │ NextChunkCtid = INVALID → 链尾
+```
+
+每个 Chunk 比普通 Tuple 多 **12字节** 链接头：
+```
+LINKED_TUP_CHUNK_EXTRA_HEADER_SIZE = sizeof(ItemPointerData) + sizeof(uint32)
+                                   = 8B（ctid）+ 4B（chunk数）= 12B
+```
+
+#### m_linkInfo 标记（HeapDiskTuple 的 m_info 字段中）
+
+```cpp
+enum class HeapDiskTupLinkInfoType {
+    TUP_NO_LINK_TYPE         = 0,  // 普通 Tuple
+    TUP_LINK_FIRST_CHUNK_TYPE    = 1,  // BigTuple 首 Chunk
+    TUP_LINK_NOT_FIRST_CHUNK_TYPE = 2,  // BigTuple 后续 Chunk
+};
+```
+
+---
+
+### 7.3 INSERT：SplitTupIntoChunks + 反向插入
+
+#### 分块（SplitTupIntoChunks）
+
+```cpp
+// src/heap/dstore_heap_insert.cpp
+RetStatus HeapInsertHandler::SplitTupIntoChunks(HeapTuple *tuple)
+{
+    const uint32 maxChunkDataSize = maxTupSpaceSize
+                                  - sizeof(HeapDiskTuple)
+                                  - LINKED_TUP_CHUNK_EXTRA_HEADER_SIZE;
+
+    numTupChunks = (dataSize + maxChunkDataSize - 1) / maxChunkDataSize;
+
+    for (i = 0; i < numTupChunks; i++) {
+        if (i == 0) {
+            chunk->SetFirstLinkChunk();
+            chunk->SetNumTupChunks(numTupChunks);
+        } else {
+            chunk->SetNotFirstLinkChunk();
+        }
+        chunk->SetNextChunkCtid(INVALID_ITEM_POINTER);  // 插入时先置空
+    }
+}
+```
+
+#### 反向插入（InsertBigTuple）
+
+```cpp
+// src/heap/dstore_heap_insert.cpp
+RetStatus HeapInsertHandler::InsertBigTuple(HeapInsertContext *insertContext)
+{
+    ItemPointerData tupNextChunkCtid = INVALID_ITEM_POINTER;
+
+    // ★ 从最后一个 Chunk 开始逆序插入
+    for (int32 i = m_tupChunks.m_chunkNum - 1; i >= 0; --i) {
+        chunk->SetNextChunkCtid(tupNextChunkCtid);  // 先设好下一chunk的位置
+        InsertSmallDiskTup(insertContext, chunk, chunkSize);
+        tupNextChunkCtid = insertContext->ctid;     // 记录本chunk的位置供前一chunk链接
+    }
+}
+```
+
+**为什么反向插入？** 插入时还不知道后续 Chunk 的 ctid，反向插入使得每个 Chunk 在写入时就能正确指向下一个 Chunk。
+
+每个 Chunk 独立走 `AllocTd → 写Undo → SetTd → AddTuple → 生成WAL` 全流程，拥有各自的 TD 槽。
+
+---
+
+### 7.4 SCAN：链式读取 + 重组（FetchBigTuple + AssembleTuples）
+
+扫描到 `m_linkInfo == FIRST_CHUNK` 时触发：
+
+```cpp
+// src/heap/dstore_heap_scan.cpp
+HeapTuple *HeapScanHandler::FetchBigTuple(HeapTuple *firstChunk, bool needCheckVisibility)
+{
+    numChunks = firstChunk->GetDiskTuple()->GetNumChunks();
+    tupChunks[0] = firstChunk;
+
+    // 链式获取后续 Chunk
+    ItemPointerData ctid = firstChunk->GetDiskTuple()->GetNextChunkCtid();
+    uint32 i = 1;
+    while (ctid != INVALID_ITEM_POINTER) {
+        tuple = needCheckVisibility
+                ? FetchVisibleDiskTuple(ctid)    // 带可见性判断
+                : FetchNewestDiskTuple(ctid);    // 最新版本
+        tupChunks[i++] = tuple;
+        ctid = tuple->GetDiskTuple()->GetNextChunkCtid();
+    }
+
+    return AssembleTuples(tupChunks, numChunks);  // 重组成完整 Tuple
+}
+```
+
+#### AssembleTuples：去掉链接头，拼接数据
+
+```cpp
+HeapTuple *HeapHandler::AssembleTuples(HeapTuple **tupChunks, uint32 numChunks)
+{
+    // 计算完整 Tuple 大小（去掉每个 Chunk 的 12B 链接头）
+    bigDiskTupLen = sizeof(HeapDiskTuple);
+    for (i = 0; i < numChunks; i++) {
+        bigDiskTupLen += tupChunks[i]->GetDiskTupleSize()
+                       - sizeof(HeapDiskTuple)
+                       - LINKED_TUP_CHUNK_EXTRA_HEADER_SIZE;
+    }
+
+    // 复制首 Chunk 的 header（不含链接头）
+    memcpy(bigTup->diskTuple, firstChunk->diskTuple, sizeof(HeapDiskTuple));
+
+    // 逐段拼接数据
+    for (i = 0; i < numChunks; i++) {
+        src = chunk->data + LINKED_TUP_CHUNK_EXTRA_HEADER_SIZE;  // 跳过链接头
+        memcpy(dst, src, dataLen);
+        dst += dataLen;
+    }
+
+    bigTup->diskTuple->SetNoLink();  // ★ 清除 BigTuple 标记，变回普通 Tuple
+    return bigTup;
+}
+```
+
+---
+
+### 7.5 DELETE：链式删除（DeleteBigTuple）
+
+```cpp
+// src/heap/dstore_heap_delete.cpp
+RetStatus HeapDeleteHandler::DeleteBigTuple(HeapDeleteContext *delContext)
+{
+    ItemPointerData ctid = delContext->ctid;
+    ItemPointerData nextCtid = GetNextChunk(bufDesc, ctid.GetOffset());
+
+    // 删除首 Chunk
+    DeleteDiskTuple(delContext, ctid.GetOffset());
+
+    // 链式删除后续 Chunk
+    while (nextCtid != INVALID_ITEM_POINTER) {
+        ctid = nextCtid;
+        bufDesc = bufMgr->Read(ctid.GetPageId(), LW_EXCLUSIVE);
+        nextCtid = GetNextChunk(bufDesc, ctid.GetOffset());  // 先取下一跳，再删
+        DeleteDiskTuple(delContext, ctid.GetOffset());
+    }
+}
+```
+
+**注意**：必须先读取 `nextCtid` 再删除，否则删除后链接信息丢失。
+
+---
+
+### 7.6 UPDATE：三种情况
+
+UPDATE 时先判断新旧 Tuple 是否为 BigTuple，以及 Chunk 数量变化：
+
+```
+判断逻辑:
+  oldIsLinked  = 旧Tuple.IsLinked()
+  newIsBig     = HeapPage::TupBiggerThanPage(newTuple)
+
+  Case A: 新chunk数 >= 旧chunk数 → UpdateBigTupSizeBigger
+            ├─ 复用旧 Chunk 槽（减少新页分配）
+            └─ 末尾追加新增 Chunk
+
+  Case B: 新chunk数 < 旧chunk数 → UpdateBigTupSizeSmaller
+            ├─ 删除多余的旧 Chunk
+            └─ 用新数据覆盖保留的 Chunk
+
+  Case C: 新Tuple变小到普通大小 → 也走 UpdateBigTupSizeSmaller
+            └─ 删除所有后续 Chunk，首 Chunk 变回普通 Tuple
+```
+
+---
+
+### 7.7 BigTuple 与 TD / Undo / WAL 的关系
+
+| 方面 | BigTuple 处理方式 |
+|------|-----------------|
+| **TD** | 每个 Chunk 独立分配一个 TD 槽；首 Chunk 的 TD 是"主" TD |
+| **Undo** | 每个 Chunk 独立写 Undo 记录，Undo 链按 Chunk 维护 |
+| **WAL** | 每个 Chunk 独立生成 WAL；链接变化（NextChunkCtid）通过 `WAL_HEAP_UPDATE_NEXT_CTID` 类型单独记录 |
+| **回滚** | `RollbackBigTuple()` 链式遍历所有 Chunk 逐一回滚 |
+| **可见性** | `FetchBigTuple()` 对每个 Chunk 独立做 MVCC 可见性判断，再组装 |
+
+---
+
+### 7.8 BigTuple 小结
+
+```
+普通 Tuple（≤7.8KB）：
+  一个 ItemId → 一个 HeapDiskTuple → 一个 TD
+
+BigTuple（>7.8KB）：
+  一个逻辑行 → N 个 Chunk（每个Chunk是独立HeapDiskTuple）
+  首Chunk: m_linkInfo=FIRST，含 NumChunks + NextCtid
+  后续Chunk: m_linkInfo=NOT_FIRST，含 NextCtid
+  链尾Chunk: NextCtid = INVALID
+
+  INSERT: 反向插入（从尾到头），使 NextCtid 在写入时即可确定
+  SCAN:   顺序读 + 跳过12B链接头 + AssembleTuples 重组
+  DELETE: 链式删除（先读nextCtid再删当前）
+  UPDATE: 按chunk数量增减决定复用/删除/追加策略
+```

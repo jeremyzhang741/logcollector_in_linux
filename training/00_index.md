@@ -1,6 +1,6 @@
 # DStore 存储引擎培训材料总目录
 
-本培训材料由 5 个模块组成，面向数据库内核新手，结合具体代码（文件路径+行号）深入讲解 dstore 各核心模块。
+本培训材料由 9 个模块组成，面向数据库内核新手，结合具体代码（文件路径+行号）深入讲解 dstore 各核心模块。
 
 ---
 
@@ -13,6 +13,10 @@
 | 03 | Undo | [03_undo.md](03_undo.md) | Undo 记录结构、版本链、旧版本重建 |
 | 04 | Index/BTree | [04_index_btree.md](04_index_btree.md) | BTree 结构、分裂、索引 MVCC |
 | 05 | WAL | [05_wal.md](05_wal.md) | WAL 写入流程、多日志流、Redo 恢复 |
+| 06 | Heap | [06_heap.md](06_heap.md) | 页面布局、TD 机制、可见性判断、读写路径 |
+| 07 | 系统串联 | [07_system_integration.md](07_system_integration.md) | 写入/读取/恢复三条主线、模块间契约 |
+| 08 | FSM | [08_fsm.md](08_fsm.md) | 空闲空间管理、多层树结构、插入协作 |
+| 09 | Checkpoint | [09_checkpoint.md](09_checkpoint.md) | 脏页刷盘、diskRecoveryPlsn、WAL截断 |
 
 ---
 
