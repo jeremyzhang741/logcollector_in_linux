@@ -688,6 +688,30 @@
 
         .analysis-body {
             padding: 1.5rem;
+            transition: none;
+        }
+
+        .analysis-section.collapsed .analysis-body {
+            display: none;
+        }
+
+        .analysis-title {
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .collapse-arrow {
+            display: inline-block;
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            transition: transform 0.2s ease;
+            margin-right: 0.25rem;
+            width: 1em;
+            text-align: center;
+        }
+
+        .analysis-section.collapsed .collapse-arrow {
+            transform: rotate(-90deg);
         }
 
         .analysis-table {
@@ -1185,13 +1209,20 @@
         // ==================== 分析视图 ====================
         let analysisTimeRange = 0; // 分钟，0 = 全部时间
 
+        function toggleAnalysisSection(sectionId) {
+            const section = document.getElementById(sectionId);
+            if (section) section.classList.toggle('collapsed');
+        }
+
         async function loadAnalysisView() {
             const container = document.getElementById('content-area');
             container.innerHTML = `
                 <div class="analysis-container">
-                    <div class="analysis-section">
+                    <!-- 热点页面 -->
+                    <div class="analysis-section" id="section-hot-pages">
                         <div class="analysis-header">
-                            <div class="analysis-title">
+                            <div class="analysis-title" onclick="toggleAnalysisSection('section-hot-pages')">
+                                <span class="collapse-arrow">▼</span>
                                 🔥 热点页面检测
                                 <span class="analysis-badge" id="hot-pages-count">-</span>
                             </div>
@@ -1207,6 +1238,14 @@
                                     <option value="1440">24 小时</option>
                                     <option value="10080">7 天</option>
                                 </select>
+                                <label style="color:var(--text-secondary);font-size:0.85rem;">显示条数:</label>
+                                <select class="filter-select" id="hot-pages-limit" onchange="loadHotPages()">
+                                    <option value="50">50</option>
+                                    <option value="100">100</option>
+                                    <option value="200">200</option>
+                                    <option value="500">500</option>
+                                    <option value="0">全部</option>
+                                </select>
                                 <button class="btn btn-primary" onclick="loadHotPages()">刷新</button>
                             </div>
                         </div>
@@ -1217,17 +1256,39 @@
                         </div>
                     </div>
 
-                    <div class="analysis-section">
+                    <!-- 孤儿事务 -->
+                    <div class="analysis-section" id="section-orphan">
                         <div class="analysis-header">
-                            <div class="analysis-title">
-                                ⚠️ 事务完整性分析
+                            <div class="analysis-title" onclick="toggleAnalysisSection('section-orphan')">
+                                <span class="collapse-arrow">▼</span>
+                                🚨 孤儿事务
+                                <span class="analysis-badge" style="background:var(--accent-red);" id="orphan-count">-</span>
                             </div>
                             <div class="analysis-controls">
                                 <button class="btn btn-primary" onclick="loadTxIntegrity()">刷新</button>
                             </div>
                         </div>
                         <div class="analysis-body">
-                            <div id="tx-integrity-content">
+                            <div id="orphan-content">
+                                <div class="loading"><div class="spinner"></div></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 高 WAL 事务 -->
+                    <div class="analysis-section" id="section-high-wal">
+                        <div class="analysis-header">
+                            <div class="analysis-title" onclick="toggleAnalysisSection('section-high-wal')">
+                                <span class="collapse-arrow">▼</span>
+                                📊 高 WAL 事务
+                                <span class="analysis-badge" style="background:var(--accent-cyan);color:var(--bg-primary);" id="high-wal-count">-</span>
+                            </div>
+                            <div class="analysis-controls">
+                                <button class="btn btn-primary" onclick="loadTxIntegrity()">刷新</button>
+                            </div>
+                        </div>
+                        <div class="analysis-body">
+                            <div id="high-wal-content">
                                 <div class="loading"><div class="spinner"></div></div>
                             </div>
                         </div>
@@ -1249,7 +1310,8 @@
             contentEl.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
 
             try {
-                const url = `/api/analysis/hot-pages?server_id=${currentServerId || ''}&time_range=${analysisTimeRange}&limit=50`;
+                const limitVal = document.getElementById('hot-pages-limit')?.value ?? '50';
+                const url = `/api/analysis/hot-pages?server_id=${currentServerId || ''}&time_range=${analysisTimeRange}&limit=${limitVal}`;
                 const res = await fetch(url);
                 const data = await res.json();
 
@@ -1308,111 +1370,72 @@
             }
         }
 
+        function renderTxTable(txList, metricClass) {
+            return `
+                <table class="analysis-table">
+                    <thead>
+                        <tr>
+                            <th style="width:50px;">#</th>
+                            <th style="width:150px;">XID</th>
+                            <th style="width:100px;">WAL 条数</th>
+                            <th style="width:100px;">页面数</th>
+                            <th>操作类型</th>
+                            <th style="width:140px;">首次/最后接收</th>
+                            <th style="width:80px;">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${txList.map((tx, i) => `
+                            <tr>
+                                <td>${i + 1}</td>
+                                <td class="clickable" onclick="filterByField('xid', '${tx.xid}')">${tx.xid}</td>
+                                <td><span class="metric-value ${metricClass}">${tx.wal_count}</span></td>
+                                <td>${tx.page_count}</td>
+                                <td><div class="tag-list">${tx.op_types.map(t => `<span class="tag">${t}</span>`).join('')}</div></td>
+                                <td style="font-size:0.7rem;">${formatTime(tx.start_time)}<br>${formatTime(tx.end_time)}</td>
+                                <td><button class="btn btn-secondary" style="padding:0.25rem 0.5rem;font-size:0.75rem;"
+                                    onclick="filterByField('xid', '${tx.xid}')">查看</button></td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>`;
+        }
+
         async function loadTxIntegrity() {
-            const contentEl = document.getElementById('tx-integrity-content');
-            if (!contentEl) return;
-            contentEl.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
+            const orphanEl = document.getElementById('orphan-content');
+            const highWalEl = document.getElementById('high-wal-content');
+            if (!orphanEl || !highWalEl) return;
+            const loading = '<div class="loading"><div class="spinner"></div></div>';
+            orphanEl.innerHTML = loading;
+            highWalEl.innerHTML = loading;
 
             try {
                 const url = `/api/analysis/tx-integrity?server_id=${currentServerId || ''}&min_wal_count=10&limit=100`;
-                const res = await fetch(url);
-                const data = await res.json();
-
-                let html = '';
+                const data = await fetch(url).then(r => r.json());
 
                 // 孤儿事务
-                html += `<h3 style="margin-bottom:1rem;color:var(--accent-red);">🚨 孤儿事务 (${data.total_orphan})</h3>`;
+                const orphanBadge = document.getElementById('orphan-count');
+                if (orphanBadge) orphanBadge.textContent = data.total_orphan || 0;
                 if (data.orphan_transactions && data.orphan_transactions.length > 0) {
-                    html += `
-                        <table class="analysis-table" style="margin-bottom:2rem;">
-                            <thead>
-                                <tr>
-                                    <th style="width:50px;">#</th>
-                                    <th style="width:150px;">XID</th>
-                                    <th style="width:100px;">WAL 条数</th>
-                                    <th style="width:100px;">页面数</th>
-                                    <th>操作类型</th>
-                                    <th style="width:140px;">首次/最后接收</th>
-                                    <th style="width:80px;">操作</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${data.orphan_transactions.map((tx, i) => `
-                                    <tr>
-                                        <td>${i + 1}</td>
-                                        <td class="clickable" onclick="filterByField('xid', '${tx.xid}')">${tx.xid}</td>
-                                        <td><span class="metric-value metric-danger">${tx.wal_count}</span></td>
-                                        <td>${tx.page_count}</td>
-                                        <td>
-                                            <div class="tag-list">
-                                                ${tx.op_types.map(t => `<span class="tag">${t}</span>`).join('')}
-                                            </div>
-                                        </td>
-                                        <td style="font-size:0.7rem;">
-                                            ${formatTime(tx.start_time)}<br>
-                                            ${formatTime(tx.end_time)}
-                                        </td>
-                                        <td>
-                                            <button class="btn btn-secondary" style="padding:0.25rem 0.5rem;font-size:0.75rem;"
-                                                onclick="filterByField('xid', '${tx.xid}')">查看</button>
-                                        </td>
-                                    </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    `;
+                    orphanEl.innerHTML = renderTxTable(data.orphan_transactions, 'metric-danger');
                 } else {
-                    html += '<p style="color:var(--text-muted);margin-bottom:2rem;">✅ 无孤儿事务</p>';
+                    orphanEl.innerHTML = '<div class="empty-state"><p>✅ 无孤儿事务</p></div>';
                 }
 
                 // 高 WAL 事务
-                html += `<h3 style="margin-bottom:1rem;color:var(--accent-cyan);">📊 高 WAL 事务 (前 ${Math.min(20, data.total_high_wal)})</h3>`;
-                if (data.high_wal_transactions && data.high_wal_transactions.length > 0) {
-                    const topTxs = data.high_wal_transactions.slice(0, 20);
-                    html += `
-                        <table class="analysis-table">
-                            <thead>
-                                <tr>
-                                    <th style="width:50px;">#</th>
-                                    <th style="width:150px;">XID</th>
-                                    <th style="width:100px;">WAL 条数</th>
-                                    <th style="width:100px;">页面数</th>
-                                    <th>操作类型</th>
-                                    <th style="width:140px;">首次/最后接收</th>
-                                    <th style="width:80px;">操作</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${topTxs.map((tx, i) => `
-                                    <tr>
-                                        <td>${i + 1}</td>
-                                        <td class="clickable" onclick="filterByField('xid', '${tx.xid}')">${tx.xid}</td>
-                                        <td><span class="metric-value">${tx.wal_count}</span></td>
-                                        <td>${tx.page_count}</td>
-                                        <td>
-                                            <div class="tag-list">
-                                                ${tx.op_types.map(t => `<span class="tag">${t}</span>`).join('')}
-                                            </div>
-                                        </td>
-                                        <td style="font-size:0.7rem;">
-                                            ${formatTime(tx.start_time)}<br>
-                                            ${formatTime(tx.end_time)}
-                                        </td>
-                                        <td>
-                                            <button class="btn btn-secondary" style="padding:0.25rem 0.5rem;font-size:0.75rem;"
-                                                onclick="filterByField('xid', '${tx.xid}')">查看</button>
-                                        </td>
-                                    </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    `;
+                const highWalBadge = document.getElementById('high-wal-count');
+                const topTxs = (data.high_wal_transactions || []).slice(0, 20);
+                if (highWalBadge) highWalBadge.textContent = topTxs.length;
+                if (topTxs.length > 0) {
+                    highWalEl.innerHTML = renderTxTable(topTxs, '');
+                } else {
+                    highWalEl.innerHTML = '<div class="empty-state"><p>暂无数据</p></div>';
                 }
-
-                contentEl.innerHTML = html;
             } catch (e) {
                 console.error('加载事务完整性分析失败:', e);
-                contentEl.innerHTML = '<div class="empty-state"><p style="color:var(--accent-red);">加载失败</p></div>';
+                const err = '<div class="empty-state"><p style="color:var(--accent-red);">加载失败</p></div>';
+                orphanEl.innerHTML = err;
+                highWalEl.innerHTML = err;
             }
         }
 

@@ -31,12 +31,14 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==================== 配置 ====================
-SERVER_URL = os.environ.get('LOG_SERVER_URL', 'http://localhost:8080')
-STATE_DIR = os.environ.get('STATE_DIR', os.path.expanduser('~/.walcollector'))
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '5000'))
-WAL_FILE = os.environ.get('WAL_LOG_FILE', '/var/log/wal/wal.log')
+SERVER_URL     = os.environ.get('LOG_SERVER_URL', 'http://localhost:8080')
+STATE_DIR      = os.environ.get('STATE_DIR', os.path.expanduser('~/.walcollector'))
+BATCH_SIZE     = int(os.environ.get('BATCH_SIZE', '50000'))
+WAL_FILE       = os.environ.get('WAL_LOG_FILE', '/var/log/wal/wal.log')
 CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', '30'))
-WORKERS = int(os.environ.get('UPLOAD_WORKERS', '4'))
+WORKERS        = int(os.environ.get('UPLOAD_WORKERS', '4'))
+UPLOAD_TIMEOUT = int(os.environ.get('UPLOAD_TIMEOUT', '120'))
+MAX_RETRY      = int(os.environ.get('MAX_RETRY', '3'))
 
 
 # WAL 解析正则（与服务端保持一致）
@@ -85,7 +87,7 @@ def get_ip():
 
 
 def post_json(path, data, compress=True):
-    """发送 JSON 请求，支持 gzip 压缩"""
+    """发送 JSON 请求，支持 gzip 压缩 + 指数退避重试"""
     url = f'{SERVER_URL}{path}'
     body = json.dumps(data, ensure_ascii=False).encode('utf-8')
     headers = {'Content-Type': 'application/json'}
@@ -93,11 +95,26 @@ def post_json(path, data, compress=True):
         body = gzip.compress(body)
         headers['Content-Encoding'] = 'gzip'
     req = urllib.request.Request(url, data=body, headers=headers, method='POST')
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode('utf-8'))
-    except urllib.error.URLError as e:
-        return {'error': str(e)}
+
+    for attempt in range(MAX_RETRY):
+        try:
+            with urllib.request.urlopen(req, timeout=UPLOAD_TIMEOUT) as resp:
+                result = json.loads(resp.read().decode('utf-8'))
+                return result
+        except urllib.error.HTTPError as e:
+            if e.code == 400:
+                # 客户端错误，不重试
+                return {'error': f'HTTP {e.code}: {e.reason}'}
+            if e.code == 429 or e.code >= 500:
+                wait = min(2 ** attempt, 30)
+                print(f'\r[WARN] HTTP {e.code}，{wait}s 后重试 (attempt {attempt+1}/{MAX_RETRY})')
+                time.sleep(wait)
+        except urllib.error.URLError as e:
+            wait = min(2 ** attempt, 30)
+            print(f'\r[WARN] 网络错误: {e}，{wait}s 后重试 (attempt {attempt+1}/{MAX_RETRY})')
+            time.sleep(wait)
+
+    return {'error': f'上传失败，已重试 {MAX_RETRY} 次'}
 
 
 def fmt_num(n):
@@ -153,9 +170,11 @@ def upload_batch(server_id, hostname, records):
         'server_id': server_id,
         'hostname': hostname,
         'log_type': 'wal',
-        'records': records,  # 预解析字段，服务端直接 COPY 入库
+        'records': records,
     })
-    return resp.get('success', False), resp.get('inserted', 0), resp.get('error', '')
+    # 新服务端返回 'buffered'，旧版返回 'inserted'，兼容两者
+    count = resp.get('buffered', resp.get('inserted', 0))
+    return resp.get('success', False), count, resp.get('error', '')
 
 
 def upload_file(filepath, server_id, start_pos=0):
